@@ -60,6 +60,8 @@ class DQSWE:
 
         # Derived parameters
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
+        self.f_at_u = DQSWE._q2u( self.f ) # Coriolis interpolated to u-points
+        self.f_at_v = DQSWE._q2v( self.f ) # Coriolis interpolated to v-points
         self.cg = np.sqrt( self.g * self.Do )
         if not self.fo==0:
             self.Ld = self.cg / self.fo
@@ -280,11 +282,11 @@ class DQSWE:
 
         # Update momentum components with implicit terms
         edtp1 = 1. + self.alpha_e * dt * self.epsilon * rDu
-        afdt = self.alpha_f * dt * DQSWE._q2u( self.f )
+        afdt = self.alpha_f * dt * self.f_at_u
         du = ( edtp1 * udot + afdt * DQSWE._q2u( DQSWE._v2q( vdot ) ) ) / ( afdt**2 + edtp1**2 )
         self.u = self.u + dt * du
         edtp1 = 1. + self.alpha_e * dt * self.epsilon * rDv
-        afdt = self.alpha_f * dt * DQSWE._q2v( self.f )
+        afdt = self.alpha_f * dt * self.f_at_v
         dv = ( edtp1 * vdot - afdt * DQSWE._q2v( DQSWE._u2q( udot ) ) ) / ( afdt**2 + edtp1**2 )
         self.v = self.v + dt * dv
 
