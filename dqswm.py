@@ -222,20 +222,26 @@ class DQSWE:
             eta_dev = np.mean( self.eta, axis=1, keepdims=True ) - self.eta_target
             self.eta -= ( dt * self.h_relax ) * eta_dev
 
+        # Cache upwind-signed velocities (u,v are unchanged until end of step)
+        u_pos = np.maximum( self.u, 0 )
+        u_neg = np.minimum( self.u, 0 )
+        v_pos = np.maximum( self.v, 0 )
+        v_neg = np.minimum( self.v, 0 )
+
         # Continuity equation (uses u,v at [n])
         h = self.D + self.eta # Total thickness
         hq = DQSWE._u2q( DQSWE._h2u( h ) )
         if self.iter % 2==0:
-            hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
+            hu = ( u_pos * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + u_neg * h ) # Upwinded h*u on western edge
             self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
             h = self.D + self.eta
-            hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
+            hv = ( v_pos * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + v_neg * h ) # Upwinded h*v on southern edge
             self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
         else:
-            hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
+            hv = ( v_pos * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + v_neg * h ) # Upwinded h*v on southern edge
             self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
             h = self.D + self.eta
-            hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
+            hu = ( u_pos * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + u_neg * h ) # Upwinded h*u on western edge
             self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
         # h = self.D + self.eta # Needed?
 
@@ -243,8 +249,8 @@ class DQSWE:
         uip1 = np.concatenate((self.u[:, 1:], self.u[:, :1]), axis=1)
         vjp1 = np.concatenate((self.v[1:, :], self.v[:1, :]), axis=0)
         # Enquist-Oscher u^2 + v^2
-        K = np.maximum( self.u, 0 )**2 + np.minimum( uip1, 0 )**2
-        K += np.maximum( self.v, 0 )**2 + np.minimum( vjp1, 0 )**2
+        K = u_pos**2 + np.minimum( uip1, 0 )**2
+        K += v_pos**2 + np.minimum( vjp1, 0 )**2
         B = self.g * self.eta + 0.5 * K # Potential + KE
 
         Bx = DQSWE._dih( B ) / self.dx
