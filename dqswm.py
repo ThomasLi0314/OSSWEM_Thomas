@@ -275,8 +275,9 @@ class DQSWE:
         ux = DQSWE._diu( self.u ) / self.dx
 
         q = self.f + ( vx - uy )
-        q /= ( hq + self.hsub )
-        q *= ( hq / ( hq + self.hsub ) ) # Hack to mask q ##################################################
+        recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
+        q *= recip_hq_plus_hsub
+        q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q ##################################################
         # qhv = DQSWE._q2u( q ) * DQSWE._q2u( DQSWE._v2q( hv ) )  # issues with vanishing layers
         # qhu = DQSWE._q2v( q ) * DQSWE._q2v( DQSWE._u2q( hu ) )
         qhv = DQSWE._q2u( q * DQSWE._v2q( hv ) )
