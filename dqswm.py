@@ -246,11 +246,11 @@ class DQSWE:
         # h = self.D + self.eta # Needed?
 
         # Explicit accelerations
-        uip1 = np.concatenate((self.u[:, 1:], self.u[:, :1]), axis=1)
-        vjp1 = np.concatenate((self.v[1:, :], self.v[:1, :]), axis=0)
+        uip1_neg = np.concatenate((u_neg[:, 1:], u_neg[:, :1]), axis=1)
+        vjp1_neg = np.concatenate((v_neg[1:, :], v_neg[:1, :]), axis=0)
         # Enquist-Oscher u^2 + v^2
-        K = u_pos**2 + np.minimum( uip1, 0 )**2
-        K += v_pos**2 + np.minimum( vjp1, 0 )**2
+        K = u_pos**2 + uip1_neg**2
+        K += v_pos**2 + vjp1_neg**2
         B = self.g * self.eta + 0.5 * K # Potential + KE
 
         Bx = DQSWE._dih( B ) / self.dx
