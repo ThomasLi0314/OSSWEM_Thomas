@@ -220,23 +220,23 @@ class DQSWE:
         # Forcing on eta
         if self.h_relax>0:
             eta_dev = np.mean( self.eta, axis=1, keepdims=True ) - self.eta_target
-            self.eta = self.eta - ( dt * self.h_relax ) * eta_dev
+            self.eta -= ( dt * self.h_relax ) * eta_dev
 
         # Continuity equation (uses u,v at [n])
         h = self.D + self.eta # Total thickness
         hq = DQSWE._u2q( DQSWE._h2u( h ) )
         if self.iter % 2==0:
             hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
-            self.eta = self.eta - ( dt / self.dx ) * DQSWE._diu( hu )
+            self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
             h = self.D + self.eta
             hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
-            self.eta = self.eta - ( dt / self.dy ) * DQSWE._djv( hv )
+            self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
         else:
             hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
-            self.eta = self.eta - ( dt / self.dy ) * DQSWE._djv( hv )
+            self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
             h = self.D + self.eta
             hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
-            self.eta = self.eta - ( dt / self.dx ) * DQSWE._diu( hu )
+            self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
         # h = self.D + self.eta # Needed?
 
         # Explicit accelerations
@@ -244,7 +244,7 @@ class DQSWE:
         vjp1 = np.concatenate((self.v[1:, :], self.v[:1, :]), axis=0)
         # Enquist-Oscher u^2 + v^2
         K = np.maximum( self.u, 0 )**2 + np.minimum( uip1, 0 )**2
-        K = K + np.maximum( self.v, 0 )**2 + np.minimum( vjp1, 0 )**2
+        K += np.maximum( self.v, 0 )**2 + np.minimum( vjp1, 0 )**2
         B = self.g * self.eta + 0.5 * K # Potential + KE
 
         Bx = DQSWE._dih( B ) / self.dx
@@ -256,8 +256,8 @@ class DQSWE:
         ux = DQSWE._diu( self.u ) / self.dx
 
         q = self.f + ( vx - uy )
-        q = q / ( hq + self.hsub )
-        q = q * ( hq / ( hq + self.hsub ) ) # Hack to mask q ##################################################
+        q /= ( hq + self.hsub )
+        q *= ( hq / ( hq + self.hsub ) ) # Hack to mask q ##################################################
         # qhv = DQSWE._q2u( q ) * DQSWE._q2u( DQSWE._v2q( hv ) )  # issues with vanishing layers
         # qhu = DQSWE._q2v( q ) * DQSWE._q2v( DQSWE._u2q( hu ) )
         qhv = DQSWE._q2u( q * DQSWE._v2q( hv ) )
@@ -284,11 +284,11 @@ class DQSWE:
         edtp1 = 1. + self.alpha_e * dt * self.epsilon * rDu
         afdt = self.alpha_f * dt * self.f_at_u
         du = ( edtp1 * udot + afdt * DQSWE._q2u( DQSWE._v2q( vdot ) ) ) / ( afdt**2 + edtp1**2 )
-        self.u = self.u + dt * du
+        self.u += dt * du
         edtp1 = 1. + self.alpha_e * dt * self.epsilon * rDv
         afdt = self.alpha_f * dt * self.f_at_v
         dv = ( edtp1 * vdot - afdt * DQSWE._q2v( DQSWE._u2q( udot ) ) ) / ( afdt**2 + edtp1**2 )
-        self.v = self.v + dt * dv
+        self.v += dt * dv
 
         # self.Ro = np.max( ( vx - uy ) / self.f )
         self.time = self.time + dt
