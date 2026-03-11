@@ -225,16 +225,16 @@ class DQSWE:
         hq = DQSWE._u2q( DQSWE._h2u( h ) )
         if self.iter % 2==0:
             hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
-            self.eta = self.eta - ( dt / self.dx ) * ( np.concatenate((hu[:, 1:], hu[:, :1]), axis=1) - hu )
+            self.eta = self.eta - ( dt / self.dx ) * DQSWE._diu( hu )
             h = self.D + self.eta
             hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
-            self.eta = self.eta - ( dt / self.dy ) * ( np.concatenate((hv[1:, :], hv[:1, :]), axis=0) - hv )
+            self.eta = self.eta - ( dt / self.dy ) * DQSWE._djv( hv )
         else:
             hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
-            self.eta = self.eta - ( dt / self.dy ) * ( np.concatenate((hv[1:, :], hv[:1, :]), axis=0) - hv )
+            self.eta = self.eta - ( dt / self.dy ) * DQSWE._djv( hv )
             h = self.D + self.eta
             hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
-            self.eta = self.eta - ( dt / self.dx ) * ( np.concatenate((hu[:, 1:], hu[:, :1]), axis=1) - hu )
+            self.eta = self.eta - ( dt / self.dx ) * DQSWE._diu( hu )
         # h = self.D + self.eta # Needed?
 
         # Explicit accelerations
