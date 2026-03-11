@@ -169,6 +169,19 @@ class DQSWE:
         print("...done")
         return u, v, eta, time
 
+    def _im1(a):
+        """Shift a by -1 in the i-direction (periodic)."""
+        return np.concatenate((a[:, -1:], a[:, :-1]), axis=1)
+    def _ip1(a):
+        """Shift a by +1 in the i-direction (periodic)."""
+        return np.concatenate((a[:, 1:], a[:, :1]), axis=1)
+    def _jm1(a):
+        """Shift a by -1 in the j-direction (periodic)."""
+        return np.concatenate((a[-1:, :], a[:-1, :]), axis=0)
+    def _jp1(a):
+        """Shift a by +1 in the j-direction (periodic)."""
+        return np.concatenate((a[1:, :], a[:1, :]), axis=0)
+
     def _h2u(a):
         """Averages from h- to u- points. Also does v- to q-."""
         return 0.5 * ( a + np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
@@ -232,22 +245,22 @@ class DQSWE:
         h = self.D + self.eta # Total thickness
         hq = DQSWE._u2q( DQSWE._h2u( h ) )
         if self.iter % 2==0:
-            hu = ( u_pos * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + u_neg * h ) # Upwinded h*u on western edge
+            hu = ( u_pos * DQSWE._im1( h ) + u_neg * h ) # Upwinded h*u on western edge
             self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
             h = self.D + self.eta
-            hv = ( v_pos * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + v_neg * h ) # Upwinded h*v on southern edge
+            hv = ( v_pos * DQSWE._jm1( h ) + v_neg * h ) # Upwinded h*v on southern edge
             self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
         else:
-            hv = ( v_pos * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + v_neg * h ) # Upwinded h*v on southern edge
+            hv = ( v_pos * DQSWE._jm1( h ) + v_neg * h ) # Upwinded h*v on southern edge
             self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
             h = self.D + self.eta
-            hu = ( u_pos * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + u_neg * h ) # Upwinded h*u on western edge
+            hu = ( u_pos * DQSWE._im1( h ) + u_neg * h ) # Upwinded h*u on western edge
             self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
         # h = self.D + self.eta # Needed?
 
         # Explicit accelerations
-        uip1_neg = np.concatenate((u_neg[:, 1:], u_neg[:, :1]), axis=1)
-        vjp1_neg = np.concatenate((v_neg[1:, :], v_neg[:1, :]), axis=0)
+        uip1_neg = DQSWE._ip1( u_neg )
+        vjp1_neg = DQSWE._jp1( v_neg )
         # Enquist-Oscher u^2 + v^2
         K = u_pos**2 + uip1_neg**2
         K += v_pos**2 + vjp1_neg**2
