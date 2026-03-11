@@ -288,10 +288,13 @@ class DQSWE:
         h = self.D + self.eta # Total thickness
         hq = DQSWE._minh2v( DQSWE._minh2u( h ) )
         # h, hq = 1+0*h, 1+0*hq
-        uxxyy = DQSWE._dih( self.nu * h * D_tension ) / self.dx + DQSWE._djv( self.nu * hq * D_shear ) / self.dy
-        uxxyy = uxxyy / DQSWE._h2u( h + self.hsub )
-        vxxyy = DQSWE._diu( self.nu * hq * D_shear ) / self.dx - DQSWE._djh( self.nu * h * D_tension ) / self.dy
-        vxxyy = vxxyy / DQSWE._h2v( h + self.hsub )
+        nu_h_Dt = self.nu * h * D_tension
+        nu_hq_Ds = self.nu * hq * D_shear
+        h_plus_hsub = h + self.hsub
+        uxxyy = DQSWE._dih( nu_h_Dt ) / self.dx + DQSWE._djv( nu_hq_Ds ) / self.dy
+        uxxyy = uxxyy / DQSWE._h2u( h_plus_hsub )
+        vxxyy = DQSWE._diu( nu_hq_Ds ) / self.dx - DQSWE._djh( nu_h_Dt ) / self.dy
+        vxxyy = vxxyy / DQSWE._h2v( h_plus_hsub )
 
         # rDu = 1 / ( DQSWE._h2u( self.D ) + self.hsub )
         rDu = 1 / ( self.Do + self.hsub ) ##############################################################################
