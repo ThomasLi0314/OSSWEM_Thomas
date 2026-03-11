@@ -1,4 +1,209 @@
 import numpy as np
+from numba import njit
+
+
+# --- Numba-JIT shift helpers ---
+
+@njit(cache=True)
+def _nb_im1(a):
+    """Shift a by -1 in the i-direction (periodic)."""
+    result = np.empty_like(a)
+    result[:, 0] = a[:, -1]
+    result[:, 1:] = a[:, :-1]
+    return result
+
+@njit(cache=True)
+def _nb_ip1(a):
+    """Shift a by +1 in the i-direction (periodic)."""
+    result = np.empty_like(a)
+    result[:, -1] = a[:, 0]
+    result[:, :-1] = a[:, 1:]
+    return result
+
+@njit(cache=True)
+def _nb_jm1(a):
+    """Shift a by -1 in the j-direction (periodic)."""
+    result = np.empty_like(a)
+    result[0, :] = a[-1, :]
+    result[1:, :] = a[:-1, :]
+    return result
+
+@njit(cache=True)
+def _nb_jp1(a):
+    """Shift a by +1 in the j-direction (periodic)."""
+    result = np.empty_like(a)
+    result[-1, :] = a[0, :]
+    result[:-1, :] = a[1:, :]
+    return result
+
+# --- Numba-JIT averaging helpers ---
+
+@njit(cache=True)
+def _nb_h2u(a):
+    """Averages from h- to u- points. Also does v- to q-."""
+    return 0.5 * ( a + _nb_im1(a) )
+
+@njit(cache=True)
+def _nb_v2q(a):
+    """Averages from v- to q- points."""
+    return 0.5 * ( a + _nb_im1(a) )
+
+@njit(cache=True)
+def _nb_u2h(a):
+    """Averages from u- to h- points. Also does q- to v-."""
+    return 0.5 * ( a + _nb_ip1(a) )
+
+@njit(cache=True)
+def _nb_q2v(a):
+    """Averages from q- to v- points."""
+    return 0.5 * ( a + _nb_ip1(a) )
+
+@njit(cache=True)
+def _nb_h2v(a):
+    """Averages from h- to v- points. Also does u- to q-."""
+    return 0.5 * ( a + _nb_jm1(a) )
+
+@njit(cache=True)
+def _nb_u2q(a):
+    """Averages from u- to q- points."""
+    return 0.5 * ( a + _nb_jm1(a) )
+
+@njit(cache=True)
+def _nb_v2h(a):
+    """Averages from v- to h- points. Also does q- to u-."""
+    return 0.5 * ( a + _nb_jp1(a) )
+
+@njit(cache=True)
+def _nb_q2u(a):
+    """Averages from q- to u- points."""
+    return 0.5 * ( a + _nb_jp1(a) )
+
+# --- Numba-JIT difference helpers ---
+
+@njit(cache=True)
+def _nb_dih(a):
+    """Difference h- points to u- points. Also does v- to q-."""
+    return a - _nb_im1(a)
+
+@njit(cache=True)
+def _nb_diu(a):
+    """Difference u- points to h- points. Also does q- to v-."""
+    return _nb_ip1(a) - a
+
+@njit(cache=True)
+def _nb_djh(a):
+    """Difference h- points to v- points. Also does u- to q-."""
+    return a - _nb_jm1(a)
+
+@njit(cache=True)
+def _nb_djv(a):
+    """Difference v- points to h- points. Also does q- to u-."""
+    return _nb_jp1(a) - a
+
+# --- Numba-JIT minimum helpers ---
+
+@njit(cache=True)
+def _nb_minh2u(a):
+    """Minimum from h- to u- points. Also does v- to q-."""
+    return np.minimum( a, _nb_im1(a) )
+
+@njit(cache=True)
+def _nb_minh2v(a):
+    """Minimum from h- to v- points. Also does u- to q-."""
+    return np.minimum( a, _nb_jm1(a) )
+
+# --- Numba-JIT step function ---
+
+@njit(cache=True)
+def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
+                dt, dx, dy, g, Do, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
+    """JIT-compiled step function. Modifies u, v, eta in-place."""
+    nj, ni = u.shape
+
+    # Forcing on eta
+    if h_relax > 0:
+        for j in range(nj):
+            row_mean = 0.0
+            for i in range(ni):
+                row_mean += eta[j, i]
+            row_mean /= ni
+            eta_dev_j = row_mean - eta_target[j, 0]
+            for i in range(ni):
+                eta[j, i] -= ( dt * h_relax ) * eta_dev_j
+
+    # Cache upwind-signed velocities (u,v are unchanged until end of step)
+    u_pos = np.maximum( u, 0.0 )
+    u_neg = np.minimum( u, 0.0 )
+    v_pos = np.maximum( v, 0.0 )
+    v_neg = np.minimum( v, 0.0 )
+
+    # Continuity equation (uses u,v at [n])
+    h = D + eta # Total thickness
+    hq = _nb_u2q( _nb_h2u( h ) )
+    if iter_num % 2 == 0:
+        hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
+        eta -= ( dt / dx ) * _nb_diu( hu )
+        h = D + eta
+        hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
+        eta -= ( dt / dy ) * _nb_djv( hv )
+    else:
+        hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
+        eta -= ( dt / dy ) * _nb_djv( hv )
+        h = D + eta
+        hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
+        eta -= ( dt / dx ) * _nb_diu( hu )
+
+    # Explicit accelerations
+    uip1_neg = _nb_ip1( u_neg )
+    vjp1_neg = _nb_jp1( v_neg )
+    # Enquist-Oscher u^2 + v^2
+    K = u_pos**2 + uip1_neg**2
+    K += v_pos**2 + vjp1_neg**2
+    B = g * eta + 0.5 * K # Potential + KE
+
+    Bx = _nb_dih( B ) / dx
+    By = _nb_djh( B ) / dy
+
+    vx = _nb_dih( v ) / dx
+    uy = _nb_djh( u ) / dy
+    vy = _nb_djv( v ) / dy
+    ux = _nb_diu( u ) / dx
+
+    q = f + ( vx - uy )
+    recip_hq_plus_hsub = 1.0 / ( hq + hsub )
+    q *= recip_hq_plus_hsub
+    q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q
+    qhv = _nb_q2u( q * _nb_v2q( hv ) )
+    qhu = _nb_q2v( q * _nb_u2q( hu ) )
+    D_tension = ux - vy
+    D_shear = uy + vx
+    # Use latest h here, but not in q !!!
+    h = D + eta # Total thickness
+    hq = _nb_minh2v( _nb_minh2u( h ) )
+    nu_h_Dt = nu * h * D_tension
+    nu_hq_Ds = nu * hq * D_shear
+    h_plus_hsub = h + hsub
+    uxxyy = _nb_dih( nu_h_Dt ) / dx + _nb_djv( nu_hq_Ds ) / dy
+    uxxyy = uxxyy / _nb_h2u( h_plus_hsub )
+    vxxyy = _nb_diu( nu_hq_Ds ) / dx - _nb_djh( nu_h_Dt ) / dy
+    vxxyy = vxxyy / _nb_h2v( h_plus_hsub )
+
+    # rDu = 1 / ( _nb_h2u( D ) + hsub )
+    rDu = 1.0 / ( Do + hsub ) ####################################################################
+    udot = ( taux - epsilon * u ) * rDu + ( qhv - Bx ) + uxxyy
+    # rDv = 1 / ( _nb_h2v( D ) + hsub )
+    rDv = 1.0 / ( Do + hsub ) ####################################################################
+    vdot = ( tauy - epsilon * v ) * rDv - ( qhu + By ) + vxxyy
+
+    # Update momentum components with implicit terms
+    edtp1 = 1.0 + alpha_e * dt * epsilon * rDu
+    afdt = alpha_f * dt * f_at_u
+    du = ( edtp1 * udot + afdt * _nb_q2u( _nb_v2q( vdot ) ) ) / ( afdt**2 + edtp1**2 )
+    u += dt * du
+    edtp1 = 1.0 + alpha_e * dt * epsilon * rDv
+    afdt = alpha_f * dt * f_at_v
+    dv = ( edtp1 * vdot - afdt * _nb_q2v( _nb_u2q( udot ) ) ) / ( afdt**2 + edtp1**2 )
+    v += dt * dv
 
 
 class DQSWE:
@@ -60,8 +265,8 @@ class DQSWE:
 
         # Derived parameters
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
-        self.f_at_u = DQSWE._q2u( self.f ) # Coriolis interpolated to u-points
-        self.f_at_v = DQSWE._q2v( self.f ) # Coriolis interpolated to v-points
+        self.f_at_u = _nb_q2u( self.f ) # Coriolis interpolated to u-points
+        self.f_at_v = _nb_q2v( self.f ) # Coriolis interpolated to v-points
         self.cg = np.sqrt( self.g * self.Do )
         if not self.fo==0:
             self.Ld = self.cg / self.fo
@@ -169,150 +374,13 @@ class DQSWE:
         print("...done")
         return u, v, eta, time
 
-    def _im1(a):
-        """Shift a by -1 in the i-direction (periodic)."""
-        return np.concatenate((a[:, -1:], a[:, :-1]), axis=1)
-    def _ip1(a):
-        """Shift a by +1 in the i-direction (periodic)."""
-        return np.concatenate((a[:, 1:], a[:, :1]), axis=1)
-    def _jm1(a):
-        """Shift a by -1 in the j-direction (periodic)."""
-        return np.concatenate((a[-1:, :], a[:-1, :]), axis=0)
-    def _jp1(a):
-        """Shift a by +1 in the j-direction (periodic)."""
-        return np.concatenate((a[1:, :], a[:1, :]), axis=0)
-
-    def _h2u(a):
-        """Averages from h- to u- points. Also does v- to q-."""
-        return 0.5 * ( a + np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
-    def _v2q(a):
-        """Averages from v- to q- points."""
-        return 0.5 * ( a + np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
-    def _u2h(a):
-        """Averages from u- to h- points. Also does q- to v-."""
-        return 0.5 * ( a + np.concatenate((a[:, 1:], a[:, :1]), axis=1) )
-    def _q2v(a):
-        """Averages from q- to v- points."""
-        return 0.5 * ( a + np.concatenate((a[:, 1:], a[:, :1]), axis=1) )
-    def _h2v(a):
-        """Averages from h- to v- points. Also does u- to q-."""
-        return 0.5 * ( a + np.concatenate((a[-1:, :], a[:-1, :]), axis=0) )
-    def _u2q(a):
-        """Averages from u- to q- points."""
-        return 0.5 * ( a + np.concatenate((a[-1:, :], a[:-1, :]), axis=0) )
-    def _v2h(a):
-        """Averages from v- to h- points. Also does q- to u-."""
-        return 0.5 * ( a + np.concatenate((a[1:, :], a[:1, :]), axis=0) )
-    def _q2u(a):
-        """Averages from q- to u- points."""
-        return 0.5 * ( a + np.concatenate((a[1:, :], a[:1, :]), axis=0) )
-    def _dih(a):
-        """Difference h- points to u- points. Also does v- to q-."""
-        return a - np.concatenate((a[:, -1:], a[:, :-1]), axis=1)
-    def _diu(a):
-        """Difference u- points to h- points. Also does q- to v-."""
-        return np.concatenate((a[:, 1:], a[:, :1]), axis=1) - a
-    def _djh(a):
-        """Difference h- points to v- points. Also does u- to q-."""
-        return a - np.concatenate((a[-1:, :], a[:-1, :]), axis=0)
-    def _djv(a):
-        """Difference v- points to h- points. Also does q- to u-."""
-        return np.concatenate((a[1:, :], a[:1, :]), axis=0) - a
-    def _minh2u(a):
-        """Minimum from h- to u- points. Also does v- to q-."""
-        return np.minimum( a, np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
-    def _minh2v(a):
-        """Minimum from h- to v- points. Also does u- to q-."""
-        return np.minimum( a, np.concatenate((a[-1:, :], a[:-1, :]), axis=0) )
-
     def step(self, dt):
         """
         dt   - Time step [s]
         """
-
-        # Forcing on eta
-        if self.h_relax>0:
-            eta_dev = np.mean( self.eta, axis=1, keepdims=True ) - self.eta_target
-            self.eta -= ( dt * self.h_relax ) * eta_dev
-
-        # Cache upwind-signed velocities (u,v are unchanged until end of step)
-        u_pos = np.maximum( self.u, 0 )
-        u_neg = np.minimum( self.u, 0 )
-        v_pos = np.maximum( self.v, 0 )
-        v_neg = np.minimum( self.v, 0 )
-
-        # Continuity equation (uses u,v at [n])
-        h = self.D + self.eta # Total thickness
-        hq = DQSWE._u2q( DQSWE._h2u( h ) )
-        if self.iter % 2==0:
-            hu = ( u_pos * DQSWE._im1( h ) + u_neg * h ) # Upwinded h*u on western edge
-            self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
-            h = self.D + self.eta
-            hv = ( v_pos * DQSWE._jm1( h ) + v_neg * h ) # Upwinded h*v on southern edge
-            self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
-        else:
-            hv = ( v_pos * DQSWE._jm1( h ) + v_neg * h ) # Upwinded h*v on southern edge
-            self.eta -= ( dt / self.dy ) * DQSWE._djv( hv )
-            h = self.D + self.eta
-            hu = ( u_pos * DQSWE._im1( h ) + u_neg * h ) # Upwinded h*u on western edge
-            self.eta -= ( dt / self.dx ) * DQSWE._diu( hu )
-        # h = self.D + self.eta # Needed?
-
-        # Explicit accelerations
-        uip1_neg = DQSWE._ip1( u_neg )
-        vjp1_neg = DQSWE._jp1( v_neg )
-        # Enquist-Oscher u^2 + v^2
-        K = u_pos**2 + uip1_neg**2
-        K += v_pos**2 + vjp1_neg**2
-        B = self.g * self.eta + 0.5 * K # Potential + KE
-
-        Bx = DQSWE._dih( B ) / self.dx
-        By = DQSWE._djh( B ) / self.dy
-
-        vx = DQSWE._dih( self.v ) / self.dx
-        uy = DQSWE._djh( self.u ) / self.dy
-        vy = DQSWE._djv( self.v ) / self.dy
-        ux = DQSWE._diu( self.u ) / self.dx
-
-        q = self.f + ( vx - uy )
-        recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
-        q *= recip_hq_plus_hsub
-        q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q ##################################################
-        # qhv = DQSWE._q2u( q ) * DQSWE._q2u( DQSWE._v2q( hv ) )  # issues with vanishing layers
-        # qhu = DQSWE._q2v( q ) * DQSWE._q2v( DQSWE._u2q( hu ) )
-        qhv = DQSWE._q2u( q * DQSWE._v2q( hv ) )
-        qhu = DQSWE._q2v( q * DQSWE._u2q( hu ) )
-        D_tension = ( ux - vy )
-        D_shear = ( uy + vx )
-        # Use latest h here, but not in q !!!
-        h = self.D + self.eta # Total thickness
-        hq = DQSWE._minh2v( DQSWE._minh2u( h ) )
-        # h, hq = 1+0*h, 1+0*hq
-        nu_h_Dt = self.nu * h * D_tension
-        nu_hq_Ds = self.nu * hq * D_shear
-        h_plus_hsub = h + self.hsub
-        uxxyy = DQSWE._dih( nu_h_Dt ) / self.dx + DQSWE._djv( nu_hq_Ds ) / self.dy
-        uxxyy = uxxyy / DQSWE._h2u( h_plus_hsub )
-        vxxyy = DQSWE._diu( nu_hq_Ds ) / self.dx - DQSWE._djh( nu_h_Dt ) / self.dy
-        vxxyy = vxxyy / DQSWE._h2v( h_plus_hsub )
-
-        # rDu = 1 / ( DQSWE._h2u( self.D ) + self.hsub )
-        rDu = 1 / ( self.Do + self.hsub ) ##############################################################################
-        udot = ( self.taux - self.epsilon * self.u ) * rDu + ( qhv - Bx ) + uxxyy
-        # rDv = 1 / ( DQSWE._h2v( self.D ) + self.hsub )
-        rDv = 1 / ( self.Do + self.hsub ) ##############################################################################
-        vdot = ( self.tauy - self.epsilon * self.v ) * rDv - ( qhu + By ) + vxxyy
-
-        # Update momentum components with implicit terms
-        edtp1 = 1. + self.alpha_e * dt * self.epsilon * rDu
-        afdt = self.alpha_f * dt * self.f_at_u
-        du = ( edtp1 * udot + afdt * DQSWE._q2u( DQSWE._v2q( vdot ) ) ) / ( afdt**2 + edtp1**2 )
-        self.u += dt * du
-        edtp1 = 1. + self.alpha_e * dt * self.epsilon * rDv
-        afdt = self.alpha_f * dt * self.f_at_v
-        dv = ( edtp1 * vdot - afdt * DQSWE._q2v( DQSWE._u2q( udot ) ) ) / ( afdt**2 + edtp1**2 )
-        self.v += dt * dv
-
-        # self.Ro = np.max( ( vx - uy ) / self.f )
-        self.time = self.time + dt
-        self.iter = self.iter + 1
+        _step_numba(self.u, self.v, self.eta, self.D, self.taux, self.tauy,
+                    self.f, self.f_at_u, self.f_at_v, self.eta_target,
+                    dt, self.dx, self.dy, self.g, self.Do, self.epsilon, self.nu,
+                    self.alpha_f, self.alpha_e, self.h_relax, self.hsub, self.iter)
+        self.time += dt
+        self.iter += 1
