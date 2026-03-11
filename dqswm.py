@@ -169,46 +169,46 @@ class DQSWE:
 
     def _h2u(a):
         """Averages from h- to u- points. Also does v- to q-."""
-        return 0.5 * ( a + np.roll(a, +1, axis=1) )
+        return 0.5 * ( a + np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
     def _v2q(a):
         """Averages from v- to q- points."""
-        return 0.5 * ( a + np.roll(a, +1, axis=1) )
+        return 0.5 * ( a + np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
     def _u2h(a):
         """Averages from u- to h- points. Also does q- to v-."""
-        return 0.5 * ( a + np.roll(a, -1, axis=1) )
+        return 0.5 * ( a + np.concatenate((a[:, 1:], a[:, :1]), axis=1) )
     def _q2v(a):
         """Averages from q- to v- points."""
-        return 0.5 * ( a + np.roll(a, -1, axis=1) )
+        return 0.5 * ( a + np.concatenate((a[:, 1:], a[:, :1]), axis=1) )
     def _h2v(a):
         """Averages from h- to v- points. Also does u- to q-."""
-        return 0.5 * ( a + np.roll(a, +1, axis=0) )
+        return 0.5 * ( a + np.concatenate((a[-1:, :], a[:-1, :]), axis=0) )
     def _u2q(a):
         """Averages from u- to q- points."""
-        return 0.5 * ( a + np.roll(a, +1, axis=0) )
+        return 0.5 * ( a + np.concatenate((a[-1:, :], a[:-1, :]), axis=0) )
     def _v2h(a):
         """Averages from v- to h- points. Also does q- to u-."""
-        return 0.5 * ( a + np.roll(a, -1, axis=0) )
+        return 0.5 * ( a + np.concatenate((a[1:, :], a[:1, :]), axis=0) )
     def _q2u(a):
         """Averages from q- to u- points."""
-        return 0.5 * ( a + np.roll(a, -1, axis=0) )
+        return 0.5 * ( a + np.concatenate((a[1:, :], a[:1, :]), axis=0) )
     def _dih(a):
         """Difference h- points to u- points. Also does v- to q-."""
-        return a - np.roll(a, +1, axis=1)
+        return a - np.concatenate((a[:, -1:], a[:, :-1]), axis=1)
     def _diu(a):
         """Difference u- points to h- points. Also does q- to v-."""
-        return np.roll(a, -1, axis=1) - a
+        return np.concatenate((a[:, 1:], a[:, :1]), axis=1) - a
     def _djh(a):
         """Difference h- points to v- points. Also does u- to q-."""
-        return a - np.roll(a, +1, axis=0)
+        return a - np.concatenate((a[-1:, :], a[:-1, :]), axis=0)
     def _djv(a):
         """Difference v- points to h- points. Also does q- to u-."""
-        return np.roll(a, -1, axis=0) - a
+        return np.concatenate((a[1:, :], a[:1, :]), axis=0) - a
     def _minh2u(a):
         """Minimum from h- to u- points. Also does v- to q-."""
-        return np.minimum( a, np.roll(a, +1, axis=1) )
+        return np.minimum( a, np.concatenate((a[:, -1:], a[:, :-1]), axis=1) )
     def _minh2v(a):
         """Minimum from h- to v- points. Also does u- to q-."""
-        return np.minimum( a, np.roll(a, +1, axis=0) )
+        return np.minimum( a, np.concatenate((a[-1:, :], a[:-1, :]), axis=0) )
 
     def step(self, dt):
         """
@@ -224,22 +224,22 @@ class DQSWE:
         h = self.D + self.eta # Total thickness
         hq = DQSWE._u2q( DQSWE._h2u( h ) )
         if self.iter % 2==0:
-            hu = ( np.maximum( self.u, 0 ) * np.roll( h, +1, axis=1 ) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
-            self.eta = self.eta - ( dt / self.dx ) * ( np.roll( hu, -1, axis=1 ) - hu )
+            hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
+            self.eta = self.eta - ( dt / self.dx ) * ( np.concatenate((hu[:, 1:], hu[:, :1]), axis=1) - hu )
             h = self.D + self.eta
-            hv = ( np.maximum( self.v, 0 ) * np.roll( h, +1, axis=0 ) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
-            self.eta = self.eta - ( dt / self.dy ) * ( np.roll( hv, -1, axis=0 ) - hv )
+            hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
+            self.eta = self.eta - ( dt / self.dy ) * ( np.concatenate((hv[1:, :], hv[:1, :]), axis=0) - hv )
         else:
-            hv = ( np.maximum( self.v, 0 ) * np.roll( h, +1, axis=0 ) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
-            self.eta = self.eta - ( dt / self.dy ) * ( np.roll( hv, -1, axis=0 ) - hv )
+            hv = ( np.maximum( self.v, 0 ) * np.concatenate((h[-1:, :], h[:-1, :]), axis=0) + np.minimum( self.v, 0 ) * h ) # Upwinded h*v on southern edge
+            self.eta = self.eta - ( dt / self.dy ) * ( np.concatenate((hv[1:, :], hv[:1, :]), axis=0) - hv )
             h = self.D + self.eta
-            hu = ( np.maximum( self.u, 0 ) * np.roll( h, +1, axis=1 ) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
-            self.eta = self.eta - ( dt / self.dx ) * ( np.roll( hu, -1, axis=1 ) - hu )
+            hu = ( np.maximum( self.u, 0 ) * np.concatenate((h[:, -1:], h[:, :-1]), axis=1) + np.minimum( self.u, 0 ) * h ) # Upwinded h*u on western edge
+            self.eta = self.eta - ( dt / self.dx ) * ( np.concatenate((hu[:, 1:], hu[:, :1]), axis=1) - hu )
         # h = self.D + self.eta # Needed?
 
         # Explicit accelerations
-        uip1 = np.roll( self.u, -1, axis=1 )
-        vjp1 = np.roll( self.v, -1, axis=0 )
+        uip1 = np.concatenate((self.u[:, 1:], self.u[:, :1]), axis=1)
+        vjp1 = np.concatenate((self.v[1:, :], self.v[:1, :]), axis=0)
         # Enquist-Oscher u^2 + v^2
         K = np.maximum( self.u, 0 )**2 + np.minimum( uip1, 0 )**2
         K = K + np.maximum( self.v, 0 )**2 + np.minimum( vjp1, 0 )**2
