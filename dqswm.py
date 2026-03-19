@@ -112,6 +112,13 @@ def _nb_minh2v(a):
     """Minimum from h- to v- points. Also does u- to q-."""
     return np.minimum( a, _nb_jm1(a) )
 
+# --- Numba-JIT physical functions ---
+
+@njit(cache=True)
+def _nb_vxuy(u, v, rdx, rdy):
+    """Calculate components of relative vorticity"""
+    return _nb_dih( v ) * rdx, _nb_djh( u ) * rdy
+
 # --- Numba-JIT step function ---
 
 @njit(cache=True)
@@ -119,6 +126,9 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
                 dt, dx, dy, g, Do, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, eta in-place."""
     nj, ni = u.shape
+
+    rdx = 1 / dx
+    rdy = 1 / dy
 
     # Forcing on eta
     if h_relax > 0:
@@ -142,16 +152,16 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     hq = _nb_u2q( _nb_h2u( h ) )
     if iter_num % 2 == 0:
         hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
-        eta -= ( dt / dx ) * _nb_diu( hu )
+        eta -= ( dt * rdx ) * _nb_diu( hu )
         h = D + eta
         hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
-        eta -= ( dt / dy ) * _nb_djv( hv )
+        eta -= ( dt * rdy ) * _nb_djv( hv )
     else:
         hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
-        eta -= ( dt / dy ) * _nb_djv( hv )
+        eta -= ( dt * rdy ) * _nb_djv( hv )
         h = D + eta
         hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
-        eta -= ( dt / dx ) * _nb_diu( hu )
+        eta -= ( dt * rdx ) * _nb_diu( hu )
 
     # Explicit accelerations
     uip1_neg = _nb_ip1( u_neg )
@@ -161,13 +171,14 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     K += v_pos**2 + vjp1_neg**2
     B = g * eta + 0.5 * K # Potential + KE
 
-    Bx = _nb_dih( B ) / dx
-    By = _nb_djh( B ) / dy
+    Bx = _nb_dih( B ) * rdx
+    By = _nb_djh( B ) * rdy
 
-    vx = _nb_dih( v ) / dx
-    uy = _nb_djh( u ) / dy
-    vy = _nb_djv( v ) / dy
-    ux = _nb_diu( u ) / dx
+    # vx = _nb_dih( v ) * rdx
+    # uy = _nb_djh( u ) * rdy
+    vx, uy = _nb_vxuy(u, v, rdx, rdy)
+    vy = _nb_djv( v ) * rdy
+    ux = _nb_diu( u ) * rdx
 
     q = f + ( vx - uy )
     recip_hq_plus_hsub = 1.0 / ( hq + hsub )
@@ -183,9 +194,9 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     nu_h_Dt = nu * h * D_tension
     nu_hq_Ds = nu * hq * D_shear
     h_plus_hsub = h + hsub
-    uxxyy = _nb_dih( nu_h_Dt ) / dx + _nb_djv( nu_hq_Ds ) / dy
+    uxxyy = _nb_dih( nu_h_Dt ) * rdx + _nb_djv( nu_hq_Ds ) * rdy
     uxxyy = uxxyy / _nb_h2u( h_plus_hsub )
-    vxxyy = _nb_diu( nu_hq_Ds ) / dx - _nb_djh( nu_h_Dt ) / dy
+    vxxyy = _nb_diu( nu_hq_Ds ) * rdx - _nb_djh( nu_h_Dt ) * rdy
     vxxyy = vxxyy / _nb_h2v( h_plus_hsub )
 
     # rDu = 1 / ( _nb_h2u( D ) + hsub )
@@ -330,7 +341,7 @@ class DQSWE:
 
     def set_eta_forcing(self, eta_mag):
         """Sets the forcing profile to which the zonal averagin eta is restored"""
-        self.eta_target = eta_mag * np.cos( 2 * np.pi * np.mean( self.yh, axis=1, keepdims=True ) / self.Ly)
+        self.eta_target = eta_mag * np.sin( 2 * np.pi * np.mean( self.yh, axis=1, keepdims=True ) / self.Ly )**3
 
     def run(self, dt, samp, nsamps):
         """
@@ -365,7 +376,10 @@ class DQSWE:
         nsamp = 0
         for iter in range( 1, nsteps + 1 ):
             self.step( dt )
-            if iter % samp ==0:
+            if np.any( np.isnan( self.u ) ):
+                print('Model has blown up!!! Stopping early')
+                break
+            if iter % samp == 0:
                 nsamp += 1
                 u[nsamp] = self.u.copy()
                 v[nsamp] = self.v.copy()
@@ -384,3 +398,27 @@ class DQSWE:
                     self.alpha_f, self.alpha_e, self.h_relax, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
+
+    def abs_omega(self, u=None, v=None):
+        """
+        Return absolute vorticity, f + vx - uy  [s-1]
+        """
+        if u is None: u = self.u
+        if v is None: v = self.v
+        vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
+        return self.f + ( vx - uy )
+
+    def q(self, eta=None, u=None, v=None):
+        """
+        Return potential vorticity, q = ( f + vx - uy ) / h  [s-1m-1]
+        """
+        if eta is None: eta = self.eta
+        if u is None: u = self.u
+        if v is None: v = self.v
+        h = self.D + eta # Total thickness
+        hq = _nb_u2q( _nb_h2u( h ) )
+        recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
+        q = self.abs_omega(u=u, v=v)
+        q *= recip_hq_plus_hsub
+        q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q
+        return q
