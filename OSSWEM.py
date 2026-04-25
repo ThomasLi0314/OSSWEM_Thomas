@@ -217,7 +217,8 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     v += dt * dv
 
 
-class DQSWE:
+class SSWEM:
+    """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
     def __init__(self, ni, g, Do, Lx, fo, beta, epsilon, nu, h_relax=0, hsub=1e-12):
         """
@@ -339,9 +340,24 @@ class DQSWE:
             r2 = r2 + ( ( self.yh - y0 ) / L )**2
         self.eta = self.eta + eta_mag * np.exp( - 0.5 * r2 )
 
+    def _cubint(x, xa, xb):
+        """Returns f(x) with a cubic interpolating between f(xa)=0 and f(xb)=1"""
+        # z is non-dimensional coordinate between xa,xb s.t. z(xa)=0 and z(xb)=1
+        z = np.minimum( np.maximum( x - xa, 0 ) / ( xb - xa ), 1 )
+        # We wand t gradient to be symmetric about z=1/2, positive between z=0 and z=1,
+        # and zero at z=0 and z=1. The gradient is thus proportional to 1-(2z-1)^2.
+        # Let g(z) = A ( 1 - ( 2 z - 1 )^2 ) = A ( 4 z - 4 z^2 ) = 4 A z ( 1 - z ) then
+        # f(z) = int_dz g(z) = C + A ( 2 z^2 - 4/3 z^3 ) = C + A/3 ( 6 - 4 z) z^2
+        # f(0)=0 => C=0 and f(1)=1 => A=3/2
+        # Thus f(z) = ( 3 - 2 z ) z^2.
+        # Note that g(1/2) = 4 . 3/2 . 1/4 = 3/2
+        return ( 1 + 2 * ( 1 - z ) ) * z**2
+        
     def set_eta_forcing(self, eta_mag):
         """Sets the forcing profile to which the zonal averagin eta is restored"""
-        self.eta_target = eta_mag * np.sin( 2 * np.pi * np.mean( self.yh, axis=1, keepdims=True ) / self.Ly )**3
+        #self.eta_target = eta_mag * np.sin( 2 * np.pi * np.mean( self.yh, axis=1, keepdims=True ) / self.Ly )**3
+        self.eta_target = eta_mag * ( SSWEM._cubint( self.yh / self.Ly, 0.0, 0.1 ) -
+                                      SSWEM._cubint( self.yh / self.Ly, 0.5, 0.6 ) )
 
     def run(self, dt, samp, nsamps):
         """
