@@ -166,7 +166,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     K = u_pos**2 + uip1_neg**2
     K += v_pos**2 + vjp1_neg**2
     eta = h - D
-    B = g * eta + 0.5 * K # Potential + KE
+    M = g * eta # Montgomery potential (1-layer: M = g eta)
+    B = M + 0.5 * K # Bernoulli = potential + KE
 
     Bx = _nb_dih( B ) * rdx
     By = _nb_djh( B ) * rdy
