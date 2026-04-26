@@ -205,11 +205,11 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     vxxyy = _nb_diu( nu_hq_Ds ) * rdx - _nb_djh( nu_h_Dt ) * rdy
     vxxyy = vxxyy / _nb_h2v( h_plus_hsub )
 
-    # rDu = 1 / ( _nb_h2u( D ) + hsub )
-    rDu = 1.0 / ( Ho[0] + hsub ) ####################################################################
+    # Per-layer reciprocal nominal thickness (broadcastable to (nk, nj, ni)).
+    # Step 4 will replace this with 1/h_at_u (actual layer thickness at u-points).
+    rDu = ( 1.0 / ( Ho + hsub ) ).reshape(nk, 1, 1)
+    rDv = ( 1.0 / ( Ho + hsub ) ).reshape(nk, 1, 1)
     udot = ( taux - epsilon * u ) * rDu + ( qhv - Bx ) + uxxyy
-    # rDv = 1 / ( _nb_h2v( D ) + hsub )
-    rDv = 1.0 / ( Ho[0] + hsub ) ####################################################################
     vdot = ( tauy - epsilon * v ) * rDv - ( qhu + By ) + vxxyy
 
     # Update momentum components with implicit terms
