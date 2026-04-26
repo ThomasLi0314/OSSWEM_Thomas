@@ -135,14 +135,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     # Restoring: relax zonal-mean (h - D) toward eta_target, applied as a uniform
     # per-row adjustment to h (since D is time-invariant within the step).
     if h_relax > 0:
-        for j in range(nj):
-            row_mean_eta = 0.0
-            for i in range(ni):
-                row_mean_eta += h[j, i] - D[j, i]
-            row_mean_eta /= ni
-            eta_dev_j = row_mean_eta - eta_target[j, 0]
-            for i in range(ni):
-                h[j, i] -= ( dt * h_relax ) * eta_dev_j
+        eta_dev = ( h - D ).sum(axis=-1) / ni - eta_target[:, 0]
+        h -= ( dt * h_relax ) * eta_dev.reshape(nj, 1)
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
