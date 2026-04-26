@@ -123,10 +123,11 @@ def _nb_vxuy(u, v, rdx, rdy):
 
 @njit(cache=True)
 def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
-                dt, dx, dy, g, Do, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
+                dt, dx, dy, g, Ho, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
     is the prognostic; eta = h - D is diagnosed where needed (pressure gradient,
-    restoring)."""
+    restoring). g, Ho, h_relax are length-nk vectors; for the present 1-layer
+    code only the [0] element is used."""
     nj, ni = u.shape
 
     rdx = 1 / dx
@@ -134,9 +135,9 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
 
     # Restoring: relax zonal-mean (h - D) toward eta_target, applied as a uniform
     # per-row adjustment to h (since D is time-invariant within the step).
-    if h_relax > 0:
+    if h_relax[0] > 0:
         eta_dev = ( h - D ).sum(axis=-1) / ni - eta_target[:, 0]
-        h -= ( dt * h_relax ) * eta_dev.reshape(nj, 1)
+        h -= ( dt * h_relax[0] ) * eta_dev.reshape(nj, 1)
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
@@ -166,7 +167,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     K = u_pos**2 + uip1_neg**2
     K += v_pos**2 + vjp1_neg**2
     eta = h - D
-    M = g * eta # Montgomery potential (1-layer: M = g eta)
+    M = g[0] * eta # Montgomery potential (1-layer: M = g eta)
     B = M + 0.5 * K # Bernoulli = potential + KE
 
     Bx = _nb_dih( B ) * rdx
@@ -197,10 +198,10 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     vxxyy = vxxyy / _nb_h2v( h_plus_hsub )
 
     # rDu = 1 / ( _nb_h2u( D ) + hsub )
-    rDu = 1.0 / ( Do + hsub ) ####################################################################
+    rDu = 1.0 / ( Ho[0] + hsub ) ####################################################################
     udot = ( taux - epsilon * u ) * rDu + ( qhv - Bx ) + uxxyy
     # rDv = 1 / ( _nb_h2v( D ) + hsub )
-    rDv = 1.0 / ( Do + hsub ) ####################################################################
+    rDv = 1.0 / ( Ho[0] + hsub ) ####################################################################
     vdot = ( tauy - epsilon * v ) * rDv - ( qhu + By ) + vxxyy
 
     # Update momentum components with implicit terms
@@ -217,28 +218,41 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
-    def __init__(self, ni, g, Do, Lx, fo, beta, epsilon, nu, h_relax=0, hsub=1e-12):
+    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, h_relax=0, hsub=1e-12):
         """
         ni      - Number of cells in i-direction
-        g       - Gravity [m s-2]
-        Do      - Max depth [m]
+        g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
+                  vector. nk = len(g) sets the number of layers.
+        Ho      - Nominal layer thickness [m]; scalar or length-nk vector.
+                  Sum gives the nominal total water column depth.
         Lx      - Domain width [m]
         fo      - Coriolis [s-1]
         beta    - df/dy [m-1 s-1]
         epsilon - Drag rate [m-1 s-1]
         nu      - Lateral viscosity [m s-2]
-        h_relax - Relaxation rate of zonal average eta to profile [s-1]
+        h_relax - Restoring rate(s) for zonal-mean eta [s-1]; scalar
+                  (broadcast) or length-nk vector.
         hsub    - H sub-roundoff [m]
         """
         self.ni = ni
-        self.g = g
-        self.Do = Do
+        self.g = np.atleast_1d(np.asarray(g, dtype=float)).copy()
+        self.Ho = np.atleast_1d(np.asarray(Ho, dtype=float)).copy()
+        self.nk = self.g.size
+        if self.Ho.size != self.nk:
+            raise ValueError(f"Ho must have length nk={self.nk}, got {self.Ho.size}")
+        h_relax_arr = np.atleast_1d(np.asarray(h_relax, dtype=float))
+        if h_relax_arr.size == 1:
+            self.h_relax = np.full(self.nk, float(h_relax_arr[0]))
+        elif h_relax_arr.size == self.nk:
+            self.h_relax = h_relax_arr.astype(float).copy()
+        else:
+            raise ValueError(f"h_relax must be scalar or length nk={self.nk}, "
+                             f"got {h_relax_arr.size}")
         self.Lx = Lx
         self.fo = fo
         self.beta = beta
         self.epsilon = epsilon
         self.nu = nu
-        self.h_relax = h_relax
         self.hsub = hsub
         self.alpha_f = 0.5 # Crank-Nicholson for Coriolis
         self.alpha_e = 1.0 # Euler backward for dissipation
@@ -277,14 +291,14 @@ class SSWEM:
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
         self.f_at_u = _nb_q2u( self.f ) # Coriolis interpolated to u-points
         self.f_at_v = _nb_q2v( self.f ) # Coriolis interpolated to v-points
-        self.cg = np.sqrt( self.g * self.Do )
+        self.cg = np.sqrt( self.g[0] * self.Ho.sum() )
         if not self.fo==0:
             self.Ld = self.cg / self.fo
         else: self.Ld = None
         print("cg =", self.cg, "[m s-1]")
         print("Ld =", self.Ld, "[m]")
         if not self.beta==0:
-            self.Ls = self.epsilon / ( self.beta * self.Do )
+            self.Ls = self.epsilon / ( self.beta * self.Ho.sum() )
         else: self.Ls = None
         print("Scales: Ls=epsilon/D/beta =", self.Ls, "[m]")
         if self.Ld is not None and self.Ld>0:
@@ -310,11 +324,11 @@ class SSWEM:
 
     def flat_topog(self):
         """Set bathymetry to flat with no boundaries"""
-        self.D = self.Do + 0 * self.xh
+        self.D = self.Ho.sum() + 0 * self.xh
 
     def bowl_topog(self):
         """Set bathymetry to bowl shape"""
-        self.D = self.Do * np.sin( self.xh * np.pi / self.Lx ) * np.sin( self.yh * np.pi / self.Ly )
+        self.D = self.Ho.sum() * np.sin( self.xh * np.pi / self.Lx ) * np.sin( self.yh * np.pi / self.Ly )
         self.D[0,:] = 0 # Ensure land along southern edge
         self.D[:,0] = 0 # Ensure land along western edge
         self.D[-1,:] = 0 # Ensure land along northern edge
@@ -369,12 +383,12 @@ class SSWEM:
         samp   - Steps between samples [steps]
         nsamps - Number of sample to integrate model [steps*samp]
         """
-        print("CFL: dt*epsilon/D =", dt * self.epsilon / self.Do )
+        print("CFL: dt*epsilon/D =", dt * self.epsilon / self.Ho.sum() )
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
         print("CFL: dt*cg/dx =", dt * self.cg / self.dx )
         print("CFL: dt*nu/dx^2 =", dt * self.nu / self.dx**2 )
-        if self.h_relax>0:
-            print("CFL: dt*h_relax =", dt * self.h_relax )
+        if np.any(self.h_relax > 0):
+            print("CFL: dt*h_relax =", dt * self.h_relax.max() )
         nsteps = nsamps * samp
         print("nsteps =", nsteps)
         Trun = nsteps * dt
@@ -414,7 +428,7 @@ class SSWEM:
         """
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v, self.eta_target,
-                    dt, self.dx, self.dy, self.g, self.Do, self.epsilon, self.nu,
+                    dt, self.dx, self.dy, self.g, self.Ho, self.epsilon, self.nu,
                     self.alpha_f, self.alpha_e, self.h_relax, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
