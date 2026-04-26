@@ -317,12 +317,20 @@ class SSWEM:
             print("Res: Ls/dx =",self.Ls / self.dx)
 
     def resting_state(self):
-        """Set state to resting (u=v=0; h=D so eta=0). State arrays carry a
-        leading layer axis of length nk; for nk=1 the single layer takes the
-        full bathymetric thickness D."""
+        """Set state to resting (u=v=0). Distribute layer thicknesses so that
+        interfaces lie at their rest depths where the column is deep enough,
+        and lower layers are clipped to the bathymetry where they would
+        otherwise extend past it (h[k]=0 when blocked). Σ_k h[k] = min(D, ΣHo)
+        everywhere; for nk=1 this collapses to h[0] = min(Ho[0], D) = D."""
         self.u = np.zeros((self.nk, self.nj, self.ni))
         self.v = np.zeros((self.nk, self.nj, self.ni))
-        self.h = np.broadcast_to(self.D, (self.nk, self.nj, self.ni)).copy()
+        h = np.zeros((self.nk, self.nj, self.ni))
+        z_top = np.zeros_like(self.D)  # depth of upper interface, positive down
+        for k in range(self.nk):
+            z_bot = z_top + self.Ho[k]
+            h[k] = np.minimum(z_bot, self.D) - np.minimum(z_top, self.D)
+            z_top = z_bot
+        self.h = h
         self.time = 0
         self.iter = 0
 
