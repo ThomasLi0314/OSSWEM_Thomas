@@ -122,24 +122,27 @@ def _nb_vxuy(u, v, rdx, rdy):
 # --- Numba-JIT step function ---
 
 @njit(cache=True)
-def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
+def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
                 dt, dx, dy, g, Do, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
-    """JIT-compiled step function. Modifies u, v, eta in-place."""
+    """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
+    is the prognostic; eta = h - D is diagnosed where needed (pressure gradient,
+    restoring)."""
     nj, ni = u.shape
 
     rdx = 1 / dx
     rdy = 1 / dy
 
-    # Forcing on eta
+    # Restoring: relax zonal-mean (h - D) toward eta_target, applied as a uniform
+    # per-row adjustment to h (since D is time-invariant within the step).
     if h_relax > 0:
         for j in range(nj):
-            row_mean = 0.0
+            row_mean_eta = 0.0
             for i in range(ni):
-                row_mean += eta[j, i]
-            row_mean /= ni
-            eta_dev_j = row_mean - eta_target[j, 0]
+                row_mean_eta += h[j, i] - D[j, i]
+            row_mean_eta /= ni
+            eta_dev_j = row_mean_eta - eta_target[j, 0]
             for i in range(ni):
-                eta[j, i] -= ( dt * h_relax ) * eta_dev_j
+                h[j, i] -= ( dt * h_relax ) * eta_dev_j
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
@@ -147,21 +150,20 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     v_pos = np.maximum( v, 0.0 )
     v_neg = np.minimum( v, 0.0 )
 
-    # Continuity equation (uses u,v at [n])
-    h = D + eta # Total thickness
+    # Pre-continuity hq (used for PV in the momentum step below)
     hq = _nb_u2q( _nb_h2u( h ) )
+
+    # Continuity: integrate h directly via alternating directional split
     if iter_num % 2 == 0:
         hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
-        eta -= ( dt * rdx ) * _nb_diu( hu )
-        h = D + eta
+        h -= ( dt * rdx ) * _nb_diu( hu )
         hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
-        eta -= ( dt * rdy ) * _nb_djv( hv )
+        h -= ( dt * rdy ) * _nb_djv( hv )
     else:
         hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
-        eta -= ( dt * rdy ) * _nb_djv( hv )
-        h = D + eta
+        h -= ( dt * rdy ) * _nb_djv( hv )
         hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
-        eta -= ( dt * rdx ) * _nb_diu( hu )
+        h -= ( dt * rdx ) * _nb_diu( hu )
 
     # Explicit accelerations
     uip1_neg = _nb_ip1( u_neg )
@@ -169,6 +171,7 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     # Enquist-Oscher u^2 + v^2
     K = u_pos**2 + uip1_neg**2
     K += v_pos**2 + vjp1_neg**2
+    eta = h - D
     B = g * eta + 0.5 * K # Potential + KE
 
     Bx = _nb_dih( B ) * rdx
@@ -188,8 +191,7 @@ def _step_numba(u, v, eta, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     qhu = _nb_q2v( q * _nb_u2q( hu ) )
     D_tension = ux - vy
     D_shear = uy + vx
-    # Use latest h here, but not in q !!!
-    h = D + eta # Total thickness
+    # Use latest h here, but not in q (still using pre-continuity hq above)
     hq = _nb_minh2v( _nb_minh2u( h ) )
     nu_h_Dt = nu * h * D_tension
     nu_hq_Ds = nu * hq * D_shear
@@ -269,9 +271,10 @@ class SSWEM:
         self.xv, self.yv = np.meshgrid(self.xh1, self.yq1)
         print("Grid: dx =",self.dx,"[m]")
 
-        # Resting initial conditions, no (flat) bathymetry and no forcing
-        self.resting_state()
+        # Resting initial conditions, no (flat) bathymetry and no forcing.
+        # flat_topog must precede resting_state since rest h = D.
         self.flat_topog()
+        self.resting_state()
         self.zero_forcing()
         self.set_eta_forcing(0)
 
@@ -297,12 +300,18 @@ class SSWEM:
             print("Res: Ls/dx =",self.Ls / self.dx)
 
     def resting_state(self):
-        """Set state to resting (u=v=eta=0)"""
+        """Set state to resting (u=v=0; h=D so eta=0)"""
         self.u = np.zeros((self.nj,self.ni))
         self.v = np.zeros((self.nj,self.ni))
-        self.eta = np.zeros((self.nj,self.ni))
+        self.h = self.D.copy()
         self.time = 0
         self.iter = 0
+
+    def eta(self, h=None):
+        """Free-surface displacement, eta = h - D (diagnostic). Defaults to
+        the current state self.h; pass a snapshot/array to evaluate for that h."""
+        if h is None: h = self.h
+        return h - self.D
 
     def flat_topog(self):
         """Set bathymetry to flat with no boundaries"""
@@ -333,12 +342,12 @@ class SSWEM:
         self.tauy = 0 * self.xu # meridional wind stress [m2 s-2]
 
     def perturb_eta(self, eta_mag, L, x0, y0=None):
-        """Adds a Gaussion perturbation to eta, centered at x0,y0, with magnitude eta_mag
-        length scale L"""
+        """Adds a Gaussion perturbation to eta (equivalently to h), centered at
+        x0,y0, with magnitude eta_mag and length scale L."""
         r2 = ( ( self.xh - x0 ) / L )**2
         if y0 is not None:
             r2 = r2 + ( ( self.yh - y0 ) / L )**2
-        self.eta = self.eta + eta_mag * np.exp( - 0.5 * r2 )
+        self.h = self.h + eta_mag * np.exp( - 0.5 * r2 )
 
     def _cubint(x, xa, xb):
         """Returns f(x) with a cubic interpolating between f(xa)=0 and f(xb)=1"""
@@ -381,12 +390,12 @@ class SSWEM:
         # Pre-allocatge diagnostics to be returned from run()
         u = np.zeros((nsamps+1, self.nj, self.ni))
         v = np.zeros((nsamps+1, self.nj, self.ni))
-        eta = np.zeros((nsamps+1, self.nj, self.ni))
+        h = np.zeros((nsamps+1, self.nj, self.ni))
         time = np.zeros((nsamps+1))
 
         u[0] = self.u.copy()
         v[0] = self.v.copy()
-        eta[0] = self.eta.copy()
+        h[0] = self.h.copy()
         time[0] = self.time
 
         nsamp = 0
@@ -399,16 +408,16 @@ class SSWEM:
                 nsamp += 1
                 u[nsamp] = self.u.copy()
                 v[nsamp] = self.v.copy()
-                eta[nsamp] = self.eta.copy()
+                h[nsamp] = self.h.copy()
                 time[nsamp] = self.time
         print("...done")
-        return u, v, eta, time
+        return u, v, h, time
 
     def step(self, dt):
         """
         dt   - Time step [s]
         """
-        _step_numba(self.u, self.v, self.eta, self.D, self.taux, self.tauy,
+        _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v, self.eta_target,
                     dt, self.dx, self.dy, self.g, self.Do, self.epsilon, self.nu,
                     self.alpha_f, self.alpha_e, self.h_relax, self.hsub, self.iter)
@@ -424,14 +433,13 @@ class SSWEM:
         vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
         return self.f + ( vx - uy )
 
-    def q(self, eta=None, u=None, v=None):
+    def q(self, h=None, u=None, v=None):
         """
         Return potential vorticity, q = ( f + vx - uy ) / h  [s-1m-1]
         """
-        if eta is None: eta = self.eta
         if u is None: u = self.u
         if v is None: v = self.v
-        h = self.D + eta # Total thickness
+        if h is None: h = self.h
         hq = _nb_u2q( _nb_h2u( h ) )
         recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
         q = self.abs_omega(u=u, v=v)
