@@ -166,8 +166,16 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
     # Enquist-Oscher u^2 + v^2
     K = u_pos**2 + uip1_neg**2
     K += v_pos**2 + vjp1_neg**2
-    eta = h - D
-    M = g[0] * eta # Montgomery potential (1-layer: M = g eta)
+    # Interface positions eta[k] = -D + sum_{l=k}^{nk-1} h[l]  (cumulative from bottom)
+    eta = np.empty_like(h)
+    eta[nk-1] = h[nk-1] - D
+    for k in range(nk-2, -1, -1):
+        eta[k] = eta[k+1] + h[k]
+    # Montgomery potential M[k] = sum_{l=0}^{k} g[l] * eta[l]  (cumulative from top)
+    M = np.empty_like(h)
+    M[0] = g[0] * eta[0]
+    for k in range(1, nk):
+        M[k] = M[k-1] + g[k] * eta[k]
     B = M + 0.5 * K # Bernoulli = potential + KE
 
     Bx = _nb_dih( B ) * rdx
