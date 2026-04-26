@@ -126,18 +126,18 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
                 dt, dx, dy, g, Ho, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
     is the prognostic; eta = h - D is diagnosed where needed (pressure gradient,
-    restoring). g, Ho, h_relax are length-nk vectors; for the present 1-layer
-    code only the [0] element is used."""
-    nj, ni = u.shape
+    restoring). State arrays u, v, h have shape (nk, nj, ni). g, Ho, h_relax are
+    length-nk vectors; for the present 1-layer code only the [0] element of each
+    is used and restoring acts on layer 0 only."""
+    nk, nj, ni = u.shape
 
     rdx = 1 / dx
     rdy = 1 / dy
 
-    # Restoring: relax zonal-mean (h - D) toward eta_target, applied as a uniform
-    # per-row adjustment to h (since D is time-invariant within the step).
+    # Restoring on layer 0: relax zonal-mean (h[0] - D) toward eta_target.
     if h_relax[0] > 0:
-        eta_dev = ( h - D ).sum(axis=-1) / ni - eta_target[:, 0]
-        h -= ( dt * h_relax[0] ) * eta_dev.reshape(nj, 1)
+        eta_dev = ( h[0] - D ).sum(axis=-1) / ni - eta_target[:, 0]
+        h[0] -= ( dt * h_relax[0] ) * eta_dev.reshape(nj, 1)
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
@@ -309,18 +309,23 @@ class SSWEM:
             print("Res: Ls/dx =",self.Ls / self.dx)
 
     def resting_state(self):
-        """Set state to resting (u=v=0; h=D so eta=0)"""
-        self.u = np.zeros((self.nj,self.ni))
-        self.v = np.zeros((self.nj,self.ni))
-        self.h = self.D.copy()
+        """Set state to resting (u=v=0; h=D so eta=0). State arrays carry a
+        leading layer axis of length nk; for nk=1 the single layer takes the
+        full bathymetric thickness D."""
+        self.u = np.zeros((self.nk, self.nj, self.ni))
+        self.v = np.zeros((self.nk, self.nj, self.ni))
+        self.h = np.broadcast_to(self.D, (self.nk, self.nj, self.ni)).copy()
         self.time = 0
         self.iter = 0
 
     def eta(self, h=None):
         """Free-surface displacement, eta = h - D (diagnostic). Defaults to
-        the current state self.h; pass a snapshot/array to evaluate for that h."""
+        the current state self.h. For nk=1 the leading layer axis is squeezed."""
         if h is None: h = self.h
-        return h - self.D
+        result = h - self.D
+        if self.nk == 1 and result.ndim == 3 and result.shape[0] == 1:
+            return result[0]
+        return result
 
     def flat_topog(self):
         """Set bathymetry to flat with no boundaries"""
@@ -350,13 +355,16 @@ class SSWEM:
         self.taux = mag * np.sin( 2 * self.yu * np.pi / self.Ly ) # zonal wind stress [m2 s-2]
         self.tauy = 0 * self.xu # meridional wind stress [m2 s-2]
 
-    def perturb_eta(self, eta_mag, L, x0, y0=None):
-        """Adds a Gaussion perturbation to eta (equivalently to h), centered at
-        x0,y0, with magnitude eta_mag and length scale L."""
+    def perturb_eta(self, eta_mag, L, x0, y0=None, k=0):
+        """Adds a Gaussion perturbation to eta (equivalently to h) of layer k
+        (default k=0, the top layer), centered at x0,y0, with magnitude eta_mag
+        and length scale L."""
+        if k < 0 or k >= self.nk:
+            raise ValueError(f"k must be in [0,{self.nk-1}], got {k}")
         r2 = ( ( self.xh - x0 ) / L )**2
         if y0 is not None:
             r2 = r2 + ( ( self.yh - y0 ) / L )**2
-        self.h = self.h + eta_mag * np.exp( - 0.5 * r2 )
+        self.h[k] = self.h[k] + eta_mag * np.exp( - 0.5 * r2 )
 
     def _cubint(x, xa, xb):
         """Returns f(x) with a cubic interpolating between f(xa)=0 and f(xb)=1"""
@@ -397,14 +405,14 @@ class SSWEM:
         print("Running...")
 
         # Pre-allocatge diagnostics to be returned from run()
-        u = np.zeros((nsamps+1, self.nj, self.ni))
-        v = np.zeros((nsamps+1, self.nj, self.ni))
-        h = np.zeros((nsamps+1, self.nj, self.ni))
+        u = np.zeros((nsamps+1, self.nk, self.nj, self.ni))
+        v = np.zeros((nsamps+1, self.nk, self.nj, self.ni))
+        h = np.zeros((nsamps+1, self.nk, self.nj, self.ni))
         time = np.zeros((nsamps+1))
 
-        u[0] = self.u.copy()
-        v[0] = self.v.copy()
-        h[0] = self.h.copy()
+        u[0] = self.u
+        v[0] = self.v
+        h[0] = self.h
         time[0] = self.time
 
         nsamp = 0
@@ -415,11 +423,14 @@ class SSWEM:
                 break
             if iter % samp == 0:
                 nsamp += 1
-                u[nsamp] = self.u.copy()
-                v[nsamp] = self.v.copy()
-                h[nsamp] = self.h.copy()
+                u[nsamp] = self.u
+                v[nsamp] = self.v
+                h[nsamp] = self.h
                 time[nsamp] = self.time
         print("...done")
+        # Squeeze the layer axis when nk=1 for backward-compat plotting
+        if self.nk == 1:
+            return u[:, 0], v[:, 0], h[:, 0], time
         return u, v, h, time
 
     def step(self, dt):
@@ -435,23 +446,31 @@ class SSWEM:
 
     def abs_omega(self, u=None, v=None):
         """
-        Return absolute vorticity, f + vx - uy  [s-1]
+        Return absolute vorticity, f + vx - uy  [s-1]. For nk=1 the leading
+        layer axis is squeezed.
         """
         if u is None: u = self.u
         if v is None: v = self.v
         vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
-        return self.f + ( vx - uy )
+        result = self.f + ( vx - uy )
+        if self.nk == 1 and result.ndim == 3 and result.shape[0] == 1:
+            return result[0]
+        return result
 
     def q(self, h=None, u=None, v=None):
         """
-        Return potential vorticity, q = ( f + vx - uy ) / h  [s-1m-1]
+        Return potential vorticity, q = ( f + vx - uy ) / h  [s-1m-1]. For
+        nk=1 the leading layer axis is squeezed.
         """
         if u is None: u = self.u
         if v is None: v = self.v
         if h is None: h = self.h
         hq = _nb_u2q( _nb_h2u( h ) )
         recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
-        q = self.abs_omega(u=u, v=v)
+        vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
+        q = self.f + ( vx - uy )
         q *= recip_hq_plus_hsub
         q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q
+        if self.nk == 1 and q.ndim == 3 and q.shape[0] == 1:
+            return q[0]
         return q
