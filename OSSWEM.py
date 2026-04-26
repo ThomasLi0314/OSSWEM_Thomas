@@ -6,34 +6,34 @@ from numba import njit
 
 @njit(cache=True)
 def _nb_im1(a):
-    """Shift a by -1 in the i-direction (periodic)."""
+    """Shift a by -1 in the i-direction (last axis, periodic)."""
     result = np.empty_like(a)
-    result[:, 0] = a[:, -1]
-    result[:, 1:] = a[:, :-1]
+    result[..., 0] = a[..., -1]
+    result[..., 1:] = a[..., :-1]
     return result
 
 @njit(cache=True)
 def _nb_ip1(a):
-    """Shift a by +1 in the i-direction (periodic)."""
+    """Shift a by +1 in the i-direction (last axis, periodic)."""
     result = np.empty_like(a)
-    result[:, -1] = a[:, 0]
-    result[:, :-1] = a[:, 1:]
+    result[..., -1] = a[..., 0]
+    result[..., :-1] = a[..., 1:]
     return result
 
 @njit(cache=True)
 def _nb_jm1(a):
-    """Shift a by -1 in the j-direction (periodic)."""
+    """Shift a by -1 in the j-direction (second-to-last axis, periodic)."""
     result = np.empty_like(a)
-    result[0, :] = a[-1, :]
-    result[1:, :] = a[:-1, :]
+    result[..., 0, :] = a[..., -1, :]
+    result[..., 1:, :] = a[..., :-1, :]
     return result
 
 @njit(cache=True)
 def _nb_jp1(a):
-    """Shift a by +1 in the j-direction (periodic)."""
+    """Shift a by +1 in the j-direction (second-to-last axis, periodic)."""
     result = np.empty_like(a)
-    result[-1, :] = a[0, :]
-    result[:-1, :] = a[1:, :]
+    result[..., -1, :] = a[..., 0, :]
+    result[..., :-1, :] = a[..., 1:, :]
     return result
 
 # --- Numba-JIT averaging helpers ---
