@@ -339,19 +339,13 @@ class SSWEM:
         eta[k] = -D + sum_{l=k}^{nk-1} h[l] for k = 0..nk-1 (free-surface to
         top of bottom layer); eta[nk] = -D is the bathymetry.
 
-        h    Layer thicknesses, shape (nk, nj, ni). Defaults to self.h. For
-             nk=1 a 2D (nj, ni) array is also accepted (treated as h[0]).
+        h    Layer thicknesses, shape (nk, nj, ni). Defaults to self.h.
         k    Optional integer in [0, nk]. If given, returns the 2D field for
              that interface; otherwise returns the full (nk+1, nj, ni) stack.
         """
         if h is None:
             h = self.h
-        if h.ndim == 2:
-            if self.nk != 1:
-                raise ValueError(f"2D h requires nk=1, got nk={self.nk}")
-            h = h[None]
-        if h.shape[0] != self.nk:
-            raise ValueError(f"h must have {self.nk} layer(s), got {h.shape[0]}")
+        self._check_3d(h, 'h')
         eta = np.empty((self.nk + 1, self.nj, self.ni))
         eta[self.nk] = -self.D
         for ki in range(self.nk - 1, -1, -1):
@@ -461,9 +455,6 @@ class SSWEM:
                 h[nsamp] = self.h
                 time[nsamp] = self.time
         print("...done")
-        # Squeeze the layer axis when nk=1 for backward-compat plotting
-        if self.nk == 1:
-            return u[:, 0], v[:, 0], h[:, 0], time
         return u, v, h, time
 
     def step(self, dt):
@@ -477,23 +468,19 @@ class SSWEM:
         self.time += dt
         self.iter += 1
 
-    def _to_3d(self, a, name):
-        """Coerce a 2D (nj, ni) array to (1, nj, ni); error if it doesn't fit."""
-        if a.ndim == 2:
-            if self.nk != 1:
-                raise ValueError(f"2D {name} requires nk=1, got nk={self.nk}")
-            return a[None]
-        if a.shape[0] != self.nk:
-            raise ValueError(f"{name} must have {self.nk} layer(s), got {a.shape[0]}")
-        return a
+    def _check_3d(self, a, name):
+        """Validate a has shape (nk, nj, ni)."""
+        if a.shape != (self.nk, self.nj, self.ni):
+            raise ValueError(f"{name} must have shape ({self.nk}, {self.nj}, {self.ni}), "
+                             f"got {a.shape}")
 
     def abs_omega(self, u=None, v=None, k=None):
         """Per-layer absolute vorticity, f + vx - uy [s-1]. Returns (nk, nj, ni)
         by default; pass an integer k to return a 2D slice."""
         if u is None: u = self.u
         if v is None: v = self.v
-        u = self._to_3d(u, 'u')
-        v = self._to_3d(v, 'v')
+        self._check_3d(u, 'u')
+        self._check_3d(v, 'v')
         vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
         omega = self.f + ( vx - uy )
         if k is None:
@@ -506,9 +493,9 @@ class SSWEM:
         if u is None: u = self.u
         if v is None: v = self.v
         if h is None: h = self.h
-        h = self._to_3d(h, 'h')
-        u = self._to_3d(u, 'u')
-        v = self._to_3d(v, 'v')
+        self._check_3d(h, 'h')
+        self._check_3d(u, 'u')
+        self._check_3d(v, 'v')
         hq = _nb_u2q( _nb_h2u( h ) )
         recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
         vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
