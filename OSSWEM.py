@@ -334,14 +334,31 @@ class SSWEM:
         self.time = 0
         self.iter = 0
 
-    def eta(self, h=None):
-        """Free-surface displacement, eta = h - D (diagnostic). Defaults to
-        the current state self.h. For nk=1 the leading layer axis is squeezed."""
-        if h is None: h = self.h
-        result = h - self.D
-        if self.nk == 1 and result.ndim == 3 and result.shape[0] == 1:
-            return result[0]
-        return result
+    def eta(self, h=None, k=None):
+        """Interface positions eta_{k-1/2} (relative to mean sea level z=0).
+        eta[k] = -D + sum_{l=k}^{nk-1} h[l] for k = 0..nk-1 (free-surface to
+        top of bottom layer); eta[nk] = -D is the bathymetry.
+
+        h    Layer thicknesses, shape (nk, nj, ni). Defaults to self.h. For
+             nk=1 a 2D (nj, ni) array is also accepted (treated as h[0]).
+        k    Optional integer in [0, nk]. If given, returns the 2D field for
+             that interface; otherwise returns the full (nk+1, nj, ni) stack.
+        """
+        if h is None:
+            h = self.h
+        if h.ndim == 2:
+            if self.nk != 1:
+                raise ValueError(f"2D h requires nk=1, got nk={self.nk}")
+            h = h[None]
+        if h.shape[0] != self.nk:
+            raise ValueError(f"h must have {self.nk} layer(s), got {h.shape[0]}")
+        eta = np.empty((self.nk + 1, self.nj, self.ni))
+        eta[self.nk] = -self.D
+        for ki in range(self.nk - 1, -1, -1):
+            eta[ki] = eta[ki + 1] + h[ki]
+        if k is None:
+            return eta
+        return eta[k]
 
     def flat_topog(self):
         """Set bathymetry to flat with no boundaries"""
@@ -460,33 +477,44 @@ class SSWEM:
         self.time += dt
         self.iter += 1
 
-    def abs_omega(self, u=None, v=None):
-        """
-        Return absolute vorticity, f + vx - uy  [s-1]. For nk=1 the leading
-        layer axis is squeezed.
-        """
+    def _to_3d(self, a, name):
+        """Coerce a 2D (nj, ni) array to (1, nj, ni); error if it doesn't fit."""
+        if a.ndim == 2:
+            if self.nk != 1:
+                raise ValueError(f"2D {name} requires nk=1, got nk={self.nk}")
+            return a[None]
+        if a.shape[0] != self.nk:
+            raise ValueError(f"{name} must have {self.nk} layer(s), got {a.shape[0]}")
+        return a
+
+    def abs_omega(self, u=None, v=None, k=None):
+        """Per-layer absolute vorticity, f + vx - uy [s-1]. Returns (nk, nj, ni)
+        by default; pass an integer k to return a 2D slice."""
         if u is None: u = self.u
         if v is None: v = self.v
+        u = self._to_3d(u, 'u')
+        v = self._to_3d(v, 'v')
         vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
-        result = self.f + ( vx - uy )
-        if self.nk == 1 and result.ndim == 3 and result.shape[0] == 1:
-            return result[0]
-        return result
+        omega = self.f + ( vx - uy )
+        if k is None:
+            return omega
+        return omega[k]
 
-    def q(self, h=None, u=None, v=None):
-        """
-        Return potential vorticity, q = ( f + vx - uy ) / h  [s-1m-1]. For
-        nk=1 the leading layer axis is squeezed.
-        """
+    def q(self, h=None, u=None, v=None, k=None):
+        """Per-layer potential vorticity, q = (f + vx - uy) / h [s-1 m-1].
+        Returns (nk, nj, ni) by default; pass an integer k to return a 2D slice."""
         if u is None: u = self.u
         if v is None: v = self.v
         if h is None: h = self.h
+        h = self._to_3d(h, 'h')
+        u = self._to_3d(u, 'u')
+        v = self._to_3d(v, 'v')
         hq = _nb_u2q( _nb_h2u( h ) )
         recip_hq_plus_hsub = 1.0 / ( hq + self.hsub )
         vx, uy = _nb_vxuy(u, v, 1 / self.dx, 1 / self.dy)
         q = self.f + ( vx - uy )
         q *= recip_hq_plus_hsub
         q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q
-        if self.nk == 1 and q.ndim == 3 and q.shape[0] == 1:
-            return q[0]
-        return q
+        if k is None:
+            return q
+        return q[k]
