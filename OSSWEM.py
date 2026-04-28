@@ -122,21 +122,22 @@ def _nb_vxuy(u, v, rdx, rdy):
 # --- Numba-JIT step function ---
 
 @njit(cache=True)
-def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
+def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
                 dt, dx, dy, g, Ho, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
-    is the prognostic; eta = h - D is diagnosed where needed (pressure gradient,
-    restoring). State arrays u, v, h have shape (nk, nj, ni). g, Ho are
-    length-nk vectors. h_relax is a scalar; restoring acts on layer 0 only."""
+    is the prognostic; eta = h - D is diagnosed where needed (pressure gradient).
+    State arrays u, v, h have shape (nk, nj, ni). g, Ho are length-nk vectors.
+    h_target has shape (nk, nj) and gives the target zonal-mean thickness per
+    layer per row. h_relax is a scalar; restoring acts on layer 0 only."""
     nk, nj, ni = u.shape
 
     rdx = 1 / dx
     rdy = 1 / dy
 
-    # Restoring on layer 0: relax zonal-mean (h[0] - D) toward eta_target.
+    # Restoring on layer 0: relax zonal-mean h[0] toward h_target[0, :].
     if h_relax > 0:
-        eta_dev = ( h[0] - D ).sum(axis=-1) / ni - eta_target[:, 0]
-        h[0] -= ( dt * h_relax ) * eta_dev.reshape(nj, 1)
+        h_dev = h[0].sum(axis=-1) / ni - h_target[0, :]
+        h[0] -= ( dt * h_relax ) * h_dev.reshape(nj, 1)
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
@@ -284,7 +285,8 @@ class SSWEM:
         self.flat_topog()
         self.resting_state()
         self.zero_forcing()
-        self.set_eta_forcing(0)
+        # Default h_target = rest layer thickness per row (no perturbation)
+        self.h_target = np.tile(self.Ho[:, None], (1, self.nj)).astype(float)
 
         # Derived parameters
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
@@ -398,11 +400,17 @@ class SSWEM:
         # Note that g(1/2) = 4 . 3/2 . 1/4 = 3/2
         return ( 1 + 2 * ( 1 - z ) ) * z**2
         
-    def set_eta_forcing(self, eta_mag):
-        """Sets the forcing profile to which the zonal averagin eta is restored"""
-        #self.eta_target = eta_mag * np.sin( 2 * np.pi * np.mean( self.yh, axis=1, keepdims=True ) / self.Ly )**3
-        self.eta_target = eta_mag * ( SSWEM._cubint( self.yh / self.Ly, 0.0, 0.1 ) -
-                                      SSWEM._cubint( self.yh / self.Ly, 0.5, 0.6 ) )
+    def set_h_forcing(self, mag, k=0):
+        """Sets the meridional restoring profile for layer k. The zonal-mean
+        h[k] is restored toward h_target[k, j] = Ho[k] + mag * profile(yh1[j]/Ly).
+        Default k=0 (top layer); pass k explicitly to set a different layer.
+        Note: only layer 0's target is currently used (h_relax is scalar and
+        the restoring branch in _step_numba acts on layer 0 only)."""
+        if k < 0 or k >= self.nk:
+            raise ValueError(f"k must be in [0,{self.nk-1}], got {k}")
+        profile = ( SSWEM._cubint( self.yh1 / self.Ly, 0.0, 0.1 ) -
+                    SSWEM._cubint( self.yh1 / self.Ly, 0.5, 0.6 ) )
+        self.h_target[k, :] = self.Ho[k] + mag * profile
 
     def run(self, dt, samp, nsamps):
         """
@@ -454,7 +462,7 @@ class SSWEM:
         dt   - Time step [s]
         """
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
-                    self.f, self.f_at_u, self.f_at_v, self.eta_target,
+                    self.f, self.f_at_u, self.f_at_v, self.h_target,
                     dt, self.dx, self.dy, self.g, self.Ho, self.epsilon, self.nu,
                     self.alpha_f, self.alpha_e, self.h_relax, self.hsub, self.iter)
         self.time += dt
