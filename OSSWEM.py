@@ -126,18 +126,17 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, eta_target,
                 dt, dx, dy, g, Ho, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
     is the prognostic; eta = h - D is diagnosed where needed (pressure gradient,
-    restoring). State arrays u, v, h have shape (nk, nj, ni). g, Ho, h_relax are
-    length-nk vectors; for the present 1-layer code only the [0] element of each
-    is used and restoring acts on layer 0 only."""
+    restoring). State arrays u, v, h have shape (nk, nj, ni). g, Ho are
+    length-nk vectors. h_relax is a scalar; restoring acts on layer 0 only."""
     nk, nj, ni = u.shape
 
     rdx = 1 / dx
     rdy = 1 / dy
 
     # Restoring on layer 0: relax zonal-mean (h[0] - D) toward eta_target.
-    if h_relax[0] > 0:
+    if h_relax > 0:
         eta_dev = ( h[0] - D ).sum(axis=-1) / ni - eta_target[:, 0]
-        h[0] -= ( dt * h_relax[0] ) * eta_dev.reshape(nj, 1)
+        h[0] -= ( dt * h_relax ) * eta_dev.reshape(nj, 1)
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
@@ -238,8 +237,7 @@ class SSWEM:
         beta    - df/dy [m-1 s-1]
         epsilon - Drag rate [m-1 s-1]
         nu      - Lateral viscosity [m s-2]
-        h_relax - Restoring rate(s) for zonal-mean eta [s-1]; scalar
-                  (broadcast) or length-nk vector.
+        h_relax - Restoring rate for zonal-mean surface eta [s-1] (scalar).
         hsub    - H sub-roundoff [m]
         """
         self.ni = ni
@@ -248,14 +246,7 @@ class SSWEM:
         self.nk = self.g.size
         if self.Ho.size != self.nk:
             raise ValueError(f"Ho must have length nk={self.nk}, got {self.Ho.size}")
-        h_relax_arr = np.atleast_1d(np.asarray(h_relax, dtype=float))
-        if h_relax_arr.size == 1:
-            self.h_relax = np.full(self.nk, float(h_relax_arr[0]))
-        elif h_relax_arr.size == self.nk:
-            self.h_relax = h_relax_arr.astype(float).copy()
-        else:
-            raise ValueError(f"h_relax must be scalar or length nk={self.nk}, "
-                             f"got {h_relax_arr.size}")
+        self.h_relax = float(h_relax)
         self.Lx = Lx
         self.fo = fo
         self.beta = beta
@@ -423,8 +414,8 @@ class SSWEM:
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
         print("CFL: dt*cg/dx =", dt * self.cg / self.dx )
         print("CFL: dt*nu/dx^2 =", dt * self.nu / self.dx**2 )
-        if np.any(self.h_relax > 0):
-            print("CFL: dt*h_relax =", dt * self.h_relax.max() )
+        if self.h_relax > 0:
+            print("CFL: dt*h_relax =", dt * self.h_relax )
         nsteps = nsamps * samp
         print("nsteps =", nsteps)
         Trun = nsteps * dt
