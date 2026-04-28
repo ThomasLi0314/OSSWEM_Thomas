@@ -382,16 +382,17 @@ class SSWEM:
         self.taux = mag * np.sin( 2 * self.yu * np.pi / self.Ly ) # zonal wind stress [m2 s-2]
         self.tauy = 0 * self.xu # meridional wind stress [m2 s-2]
 
-    def perturb_eta(self, eta_mag, L, x0, y0=None, k=0):
-        """Adds a Gaussion perturbation to eta (equivalently to h) of layer k
-        (default k=0, the top layer), centered at x0,y0, with magnitude eta_mag
-        and length scale L."""
+    def perturb_h(self, mag, L, x0, y0=None, k=0):
+        """Adds a Gaussian perturbation to the thickness h of layer k (default
+        k=0, the top layer), centered at x0,y0, with magnitude mag and length
+        scale L. Adding mag to h[k] raises eta_{k-1/2} (the upper interface of
+        layer k) by the same amount, leaving lower interfaces unchanged."""
         if k < 0 or k >= self.nk:
             raise ValueError(f"k must be in [0,{self.nk-1}], got {k}")
         r2 = ( ( self.xh - x0 ) / L )**2
         if y0 is not None:
             r2 = r2 + ( ( self.yh - y0 ) / L )**2
-        self.h[k] = self.h[k] + eta_mag * np.exp( - 0.5 * r2 )
+        self.h[k] = self.h[k] + mag * np.exp( - 0.5 * r2 )
 
     def _cubint(x, xa, xb):
         """Returns f(x) with a cubic interpolating between f(xa)=0 and f(xb)=1"""
