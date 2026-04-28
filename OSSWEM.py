@@ -298,14 +298,28 @@ class SSWEM:
         else: self.Ld = None
         print("cg =", self.cg, "[m s-1]")
         print("Ld =", self.Ld, "[m]")
+        if self.nk==2:
+            self.cg1 = np.sqrt( self.g[1] * self.Ho.prod() / self.Ho.sum() )
+            if not self.fo==0:
+                self.Ld1 = self.cg1 / self.fo
+            else: self.Ld1 = None
+            print("cg1 =", self.cg1, "[m s-1]")
+            print("Ld1 =", self.Ld1, "[m]")
+        else:
+            self.cg1 = None
+            self.Ld1 = None
         if not self.beta==0:
             self.Ls = self.epsilon / ( self.beta * self.Ho.sum() )
         else: self.Ls = None
         print("Scales: Ls=epsilon/D/beta =", self.Ls, "[m]")
         if self.Ld is not None and self.Ld>0:
             print("Scales: Lx/Ld =", self.Lx / self.Ld)
-        if not self.fo==0:
+        if self.Ld1 is not None and self.Ld1>0:
+            print("Scales: Lx/Ld1 =", self.Lx / self.Ld1)
+        if self.Ld is not None:
             print("Res: Ld/dx =",self.Ld / self.dx)
+        if self.Ld1 is not None:
+            print("Res: Ld1/dx =",self.Ld1 / self.dx)
         if not self.beta==0:
             print("Res: Ls/dx =",self.Ls / self.dx)
 
@@ -421,6 +435,8 @@ class SSWEM:
         print("CFL: dt*epsilon/D =", dt * self.epsilon / self.Ho.sum() )
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
         print("CFL: dt*cg/dx =", dt * self.cg / self.dx )
+        if self.cg1 is not None:
+            print("CFL: dt*cg1/dx =", dt * self.cg1 / self.dx )
         print("CFL: dt*nu/dx^2 =", dt * self.nu / self.dx**2 )
         if self.h_relax > 0:
             print("CFL: dt*h_relax =", dt * self.h_relax )
