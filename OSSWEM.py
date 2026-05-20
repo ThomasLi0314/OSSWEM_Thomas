@@ -123,12 +123,20 @@ def _nb_vxuy(u, v, rdx, rdy):
 
 @njit(cache=True)
 def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
-                dt, dx, dy, g, Ho, epsilon, nu, alpha_f, alpha_e, h_relax, hsub, iter_num):
+                dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu, h_relax, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
     is the prognostic; eta = h - D is diagnosed where needed (pressure gradient).
-    State arrays u, v, h have shape (nk, nj, ni). g, Ho are length-nk vectors.
+    State arrays u, v, h have shape (nk, nj, ni). g is a length-nk vector.
     h_target has shape (nk, nj) and gives the target zonal-mean thickness per
-    layer per row. h_relax is a scalar; restoring acts on layer 0 only."""
+    layer per row. h_relax is a scalar; restoring acts on layer 0 only. Inverse
+    layer thicknesses are taken from the prognostic h (with +hsub to guard
+    division), not from any nominal/reference thickness.
+    Interior vertical viscosity (nu_v) and bottom drag (epsilon) together form a
+    per-column tridiagonal vertical-diffusion operator L; both are time-weighted
+    by alpha_nu (1 = Euler backward, 0 = explicit). The implicit step solves the
+    K-element coupled tridiagonal+Coriolis system per (i,j) via complex Thomas:
+    Δw = Δu + i Δv satisfies (I + alpha_nu*dt*L + i*alpha_f*dt*f) Δw = dt*(udot
+    + i vdot_at_u) at u-points (and analogously at v-points)."""
     nk, nj, ni = u.shape
 
     rdx = 1 / dx
@@ -163,9 +171,9 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
     # Explicit accelerations
     uip1_neg = _nb_ip1( u_neg )
     vjp1_neg = _nb_jp1( v_neg )
-    # Enquist-Oscher u^2 + v^2
-    K = u_pos**2 + uip1_neg**2
-    K += v_pos**2 + vjp1_neg**2
+    # Enquist-Oscher 1/2 ( u^2 + v^2 )
+    K = 0.5 * ( u_pos**2 + uip1_neg**2 )
+    K += 0.5 * ( v_pos**2 + vjp1_neg**2 )
     # Interface positions eta[k] = -D + sum_{l=k}^{nk-1} h[l]  (cumulative from bottom)
     eta = np.empty_like(h)
     eta[nk-1] = h[nk-1] - D
@@ -176,57 +184,137 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
     M[0] = g[0] * eta[0]
     for k in range(1, nk):
         M[k] = M[k-1] + g[k] * eta[k]
-    B = M + 0.5 * K # Bernoulli = potential + KE
+    B = M + K # Bernoulli = potential + KE
 
+    # Gradient of Bernoulli
     Bx = _nb_dih( B ) * rdx
     By = _nb_djh( B ) * rdy
 
+    # Components of relative vorticity and stress tensor
     # vx = _nb_dih( v ) * rdx
     # uy = _nb_djh( u ) * rdy
     vx, uy = _nb_vxuy(u, v, rdx, rdy)
     vy = _nb_djv( v ) * rdy
     ux = _nb_diu( u ) * rdx
 
+    # Potential vorticity
     q = f + ( vx - uy )
     recip_hq_plus_hsub = 1.0 / ( hq + hsub )
     q *= recip_hq_plus_hsub
     q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q
+    # q * h at u- and v-points
     qhv = _nb_q2u( q * _nb_v2q( hv ) )
     qhu = _nb_q2v( q * _nb_u2q( hu ) )
+    # For the stress tensor
     D_tension = ux - vy
     D_shear = uy + vx
     # Use latest h here, but not in q (still using pre-continuity hq above)
+    # h at q points
     hq = _nb_minh2v( _nb_minh2u( h ) )
+    # Components of stress tensor
     nu_h_Dt = nu * h * D_tension
     nu_hq_Ds = nu * hq * D_shear
-    h_plus_hsub = h + hsub
+    # h at u- and v-points
+    rhu = 1.0 / ( _nb_h2u( h ) + hsub )
+    rhv = 1.0 / ( _nb_h2v( h ) + hsub )
+    # Divergence of stress tensor
     uxxyy = _nb_dih( nu_h_Dt ) * rdx + _nb_djv( nu_hq_Ds ) * rdy
-    uxxyy = uxxyy / _nb_h2u( h_plus_hsub )
+    uxxyy = uxxyy * rhu
     vxxyy = _nb_diu( nu_hq_Ds ) * rdx - _nb_djh( nu_h_Dt ) * rdy
-    vxxyy = vxxyy / _nb_h2v( h_plus_hsub )
+    vxxyy = vxxyy * rhv
 
-    # Per-layer reciprocal nominal thickness (broadcastable to (nk, nj, ni)).
-    # Step 4 will replace this with 1/h_at_u (actual layer thickness at u-points).
-    rDu = ( 1.0 / ( Ho + hsub ) ).reshape(nk, 1, 1)
-    rDv = ( 1.0 / ( Ho + hsub ) ).reshape(nk, 1, 1)
-    udot = ( taux - epsilon * u ) * rDu + ( qhv - Bx ) + uxxyy
-    vdot = ( tauy - epsilon * v ) * rDv - ( qhu + By ) + vxxyy
+    # Wind forcing on top layer (explicit).
+    udot =   ( qhv - Bx ) + uxxyy
+    vdot = - ( qhu + By ) + vxxyy
+    udot[0,:,:] += taux * rhu[0,:,:]
+    vdot[0,:,:] += tauy * rhv[0,:,:]
 
-    # Update momentum components with implicit terms
-    edtp1 = 1.0 + alpha_e * dt * epsilon * rDu
-    afdt = alpha_f * dt * f_at_u
-    du = ( edtp1 * udot + afdt * _nb_q2u( _nb_v2q( vdot ) ) ) / ( afdt**2 + edtp1**2 )
-    u += dt * du
-    edtp1 = 1.0 + alpha_e * dt * epsilon * rDv
-    afdt = alpha_f * dt * f_at_v
-    dv = ( edtp1 * vdot - afdt * _nb_q2v( _nb_u2q( udot ) ) ) / ( afdt**2 + edtp1**2 )
-    v += dt * dv
+    # Interfacial-stress coefficients at u- and v-points (a_{k-1/2} = a_top, a_{k+1/2} = a_bot).
+    # Top:    a_top[0]    = 0 (wind is the explicit forcing applied above).
+    # Bottom: a_bot[nk-1] = epsilon (bottom drag).
+    # Interior: a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) appears as a_top[k] AND a_bot[k-1].
+    h_at_u = _nb_h2u( h )
+    h_at_v = _nb_h2v( h )
+    a_top_u = np.zeros((nk, nj, ni))
+    a_bot_u = np.zeros((nk, nj, ni))
+    a_top_v = np.zeros((nk, nj, ni))
+    a_bot_v = np.zeros((nk, nj, ni))
+    for k in range(1, nk):
+        a_int_u = 2.0 * nu_v / ( h_at_u[k-1] + h_at_u[k] + hsub )
+        a_top_u[k]   = a_int_u
+        a_bot_u[k-1] = a_int_u
+        a_int_v = 2.0 * nu_v / ( h_at_v[k-1] + h_at_v[k] + hsub )
+        a_top_v[k]   = a_int_v
+        a_bot_v[k-1] = a_int_v
+    a_bot_u[nk-1] = epsilon
+    a_bot_v[nk-1] = epsilon
+
+    # Explicit -(L u^n), -(L v^n): (L u)_k = ((a_top+a_bot) u_k - a_top u_{k-1} - a_bot u_{k+1}) / h_k.
+    # Vectorized over (j,i); k-loop only.
+    for k in range(nk):
+        Lu_k = (a_top_u[k] + a_bot_u[k]) * u[k]
+        Lv_k = (a_top_v[k] + a_bot_v[k]) * v[k]
+        if k > 0:
+            Lu_k -= a_top_u[k] * u[k-1]
+            Lv_k -= a_top_v[k] * v[k-1]
+        if k < nk - 1:
+            Lu_k -= a_bot_u[k] * u[k+1]
+            Lv_k -= a_bot_v[k] * v[k+1]
+        udot[k] -= Lu_k * rhu[k]
+        vdot[k] -= Lv_k * rhv[k]
+
+    # Implicit step: solve (M + ic I) Δw = dt(rhs_re + i rhs_im) per column, with
+    # M = I + alpha_nu*dt*L tridiagonal in k and c = alpha_f*dt*f a scalar per
+    # column. Δw = Δu + i Δv (at u-points; Δu = Re) or Δu_at_v + i Δv (at
+    # v-points; Δv = Im). Thomas runs as a k-loop of (nj, ni) array ops so
+    # everything outside the short k-loop vectorizes over (j, i).
+    vdot_at_u = _nb_q2u( _nb_v2q( vdot ) )
+    udot_at_v = _nb_q2v( _nb_u2q( udot ) )
+
+    a_sub  = np.empty((nk, nj, ni), dtype=np.complex128)
+    c_sup  = np.empty((nk, nj, ni), dtype=np.complex128)
+    b_diag = np.empty((nk, nj, ni), dtype=np.complex128)
+    rhs    = np.empty((nk, nj, ni), dtype=np.complex128)
+
+    # u-point pass: solve for Δw, take Re for Δu.
+    ic_u = alpha_f * dt * f_at_u  # imaginary part of the diagonal, shape (nj, ni)
+    for k in range(nk):
+        a_sub[k]  = -alpha_nu * dt * a_top_u[k] * rhu[k]
+        c_sup[k]  = -alpha_nu * dt * a_bot_u[k] * rhu[k]
+        b_diag[k] = ( 1.0 + alpha_nu * dt * ( a_top_u[k] + a_bot_u[k] ) * rhu[k] ) + 1j * ic_u
+        rhs[k]    = ( dt * udot[k] ) + 1j * ( dt * vdot_at_u[k] )
+    for k in range(1, nk):
+        m = a_sub[k] / b_diag[k-1]
+        b_diag[k] -= m * c_sup[k-1]
+        rhs[k]    -= m * rhs[k-1]
+    x = rhs[nk-1] / b_diag[nk-1]
+    u[nk-1] += x.real
+    for k in range(nk-2, -1, -1):
+        x = ( rhs[k] - c_sup[k] * x ) / b_diag[k]
+        u[k] += x.real
+
+    # v-point pass: solve for Δw, take Im for Δv.
+    ic_v = alpha_f * dt * f_at_v
+    for k in range(nk):
+        a_sub[k]  = -alpha_nu * dt * a_top_v[k] * rhv[k]
+        c_sup[k]  = -alpha_nu * dt * a_bot_v[k] * rhv[k]
+        b_diag[k] = ( 1.0 + alpha_nu * dt * ( a_top_v[k] + a_bot_v[k] ) * rhv[k] ) + 1j * ic_v
+        rhs[k]    = ( dt * udot_at_v[k] ) + 1j * ( dt * vdot[k] )
+    for k in range(1, nk):
+        m = a_sub[k] / b_diag[k-1]
+        b_diag[k] -= m * c_sup[k-1]
+        rhs[k]    -= m * rhs[k-1]
+    x = rhs[nk-1] / b_diag[nk-1]
+    v[nk-1] += x.imag
+    for k in range(nk-2, -1, -1):
+        x = ( rhs[k] - c_sup[k] * x ) / b_diag[k]
+        v[k] += x.imag
 
 
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
-    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, h_relax=0, hsub=1e-12):
+    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0, h_relax=0, hsub=1e-12):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -236,8 +324,10 @@ class SSWEM:
         Lx      - Domain width [m]
         fo      - Coriolis [s-1]
         beta    - df/dy [m-1 s-1]
-        epsilon - Drag rate [m-1 s-1]
-        nu      - Lateral viscosity [m s-2]
+        epsilon - Bottom drag rate [m s-1]; bottom-boundary entry of L.
+        nu      - Lateral (horizontal) viscosity [m2 s-1]
+        nu_v    - Vertical viscosity [m2 s-1]; sets interior interfacial-stress
+                  coefficients a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) for 1<k<=K. Defaults to 0.
         h_relax - Restoring rate for zonal-mean surface eta [s-1] (scalar).
         hsub    - H sub-roundoff [m]
         """
@@ -253,9 +343,10 @@ class SSWEM:
         self.beta = beta
         self.epsilon = epsilon
         self.nu = nu
+        self.nu_v = float(nu_v)
         self.hsub = hsub
         self.alpha_f = 0.5 # Crank-Nicholson for Coriolis
-        self.alpha_e = 1.0 # Euler backward for dissipation
+        self.alpha_nu = 1.0 # Euler backward for interfacial stresses (vertical viscosity + bottom drag)
 
         # Grid resolution
         self.dx = Lx / ni # Cell width [m]
@@ -432,7 +523,8 @@ class SSWEM:
         samp   - Steps between samples [steps]
         nsamps - Number of sample to integrate model [steps*samp]
         """
-        print("CFL: dt*epsilon/D =", dt * self.epsilon / self.Ho.sum() )
+        print("CFL: dt*epsilon/h_bot =", dt * self.epsilon / self.Ho[-1] )
+        print("CFL: dt*nu_v/h_min^2 =", dt * self.nu_v / ( self.Ho.min()**2 ) )
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
         print("CFL: dt*cg/dx =", dt * self.cg / self.dx )
         if self.cg1 is not None:
@@ -479,8 +571,8 @@ class SSWEM:
         """
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v, self.h_target,
-                    dt, self.dx, self.dy, self.g, self.Ho, self.epsilon, self.nu,
-                    self.alpha_f, self.alpha_e, self.h_relax, self.hsub, self.iter)
+                    dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
+                    self.alpha_f, self.alpha_nu, self.h_relax, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
 
