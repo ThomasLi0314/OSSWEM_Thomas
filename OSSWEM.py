@@ -134,9 +134,15 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
     Interior vertical viscosity (nu_v) and bottom drag (epsilon) together form a
     per-column tridiagonal vertical-diffusion operator L; both are time-weighted
     by alpha_nu (1 = Euler backward, 0 = explicit). The implicit step solves the
-    K-element coupled tridiagonal+Coriolis system per (i,j) via complex Thomas:
-    Δw = Δu + i Δv satisfies (I + alpha_nu*dt*L + i*alpha_f*dt*f) Δw = dt*(udot
-    + i vdot_at_u) at u-points (and analogously at v-points)."""
+    K-element coupled tridiagonal+Coriolis system per (i,j) via Hallberg's
+    cancellation-free TDMAH2 recurrence: rows are first scaled by their layer
+    thickness h_k to symmetrize the matrix (removing all 1/h_k factors) and to
+    bundle the Coriolis term as h_k(1+ic). The forward sweep maintains running
+    ratios q_k = a_{k+1/2}*beta and Q_k = (h_k(1+ic)+a_{k-1/2}*Q_{k-1})*beta
+    with beta_k = 1/(h_k(1+ic) + a_{k-1/2}*Q_{k-1} + a_{k+1/2}); every
+    denominator is a sum of nonnegative-real plus complex terms with positive
+    real part, so the algorithm is robust as h_k -> 0. Re(Δw) gives Δu at
+    u-points; Im(Δw) gives Δv at v-points."""
     nk, nj, ni = u.shape
 
     rdx = 1 / dx
@@ -263,52 +269,66 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
         udot[k] -= Lu_k * rhu[k]
         vdot[k] -= Lv_k * rhv[k]
 
-    # Implicit step: solve (M + ic I) Δw = dt(rhs_re + i rhs_im) per column, with
-    # M = I + alpha_nu*dt*L tridiagonal in k and c = alpha_f*dt*f a scalar per
-    # column. Δw = Δu + i Δv (at u-points; Δu = Re) or Δu_at_v + i Δv (at
-    # v-points; Δv = Im). Thomas runs as a k-loop of (nj, ni) array ops so
-    # everything outside the short k-loop vectorizes over (j, i).
+    # Implicit step: TDMAH2 (cancellation-free symmetric Thomas, Hallberg).
+    # Row-scale the system by h_k to symmetrize: the matrix becomes diag
+    # h_k(1+ic) + a^*_{k-1/2} + a^*_{k+1/2} with off-diagonals -a^*_{k±1/2},
+    # where a^*_{k±1/2} = alpha_nu*dt*a_{k±1/2} (real, ≥0) and ic = alpha_f*dt*f.
+    # RHS is h_k * dt*(udot + i vdot_at_u). Forward sweep keeps running q_k and
+    # Q_k built from sums of nonneg-real plus complex-with-positive-real-part —
+    # no catastrophic cancellation; bounded as h_k -> 0.
     vdot_at_u = _nb_q2u( _nb_v2q( vdot ) )
     udot_at_v = _nb_q2v( _nb_u2q( udot ) )
 
-    a_sub  = np.empty((nk, nj, ni), dtype=np.complex128)
-    c_sup  = np.empty((nk, nj, ni), dtype=np.complex128)
-    b_diag = np.empty((nk, nj, ni), dtype=np.complex128)
-    rhs    = np.empty((nk, nj, ni), dtype=np.complex128)
+    q       = np.empty((nk, nj, ni), dtype=np.complex128)
+    y_prime = np.empty((nk, nj, ni), dtype=np.complex128)
 
-    # u-point pass: solve for Δw, take Re for Δu.
-    ic_u = alpha_f * dt * f_at_u  # imaginary part of the diagonal, shape (nj, ni)
-    for k in range(nk):
-        a_sub[k]  = -alpha_nu * dt * a_top_u[k] * rhu[k]
-        c_sup[k]  = -alpha_nu * dt * a_bot_u[k] * rhu[k]
-        b_diag[k] = ( 1.0 + alpha_nu * dt * ( a_top_u[k] + a_bot_u[k] ) * rhu[k] ) + 1j * ic_u
-        rhs[k]    = ( dt * udot[k] ) + 1j * ( dt * vdot_at_u[k] )
+    # u-point pass: take Re(Δw) for Δu.
+    ic_u = alpha_f * dt * f_at_u   # 2D real (nj, ni)
+    hc   = h_at_u[0] * ( 1.0 + 1j * ic_u )
+    a_t  = ( alpha_nu * dt ) * a_top_u[0]   # = 0 at the surface
+    a_b  = ( alpha_nu * dt ) * a_bot_u[0]
+    beta = 1.0 / ( hc + a_t + a_b )
+    q[0] = a_b * beta
+    Q    = hc * beta
+    y_prime[0] = h_at_u[0] * ( dt * udot[0] + 1j * ( dt * vdot_at_u[0] ) ) * beta
     for k in range(1, nk):
-        m = a_sub[k] / b_diag[k-1]
-        b_diag[k] -= m * c_sup[k-1]
-        rhs[k]    -= m * rhs[k-1]
-    x = rhs[nk-1] / b_diag[nk-1]
-    u[nk-1] += x.real
+        a_t  = ( alpha_nu * dt ) * a_top_u[k]
+        a_b  = ( alpha_nu * dt ) * a_bot_u[k]
+        hc   = h_at_u[k] * ( 1.0 + 1j * ic_u )
+        beta = 1.0 / ( hc + a_t * Q + a_b )
+        q[k] = a_b * beta
+        Q    = ( hc + a_t * Q ) * beta
+        y_k  = h_at_u[k] * ( dt * udot[k] + 1j * ( dt * vdot_at_u[k] ) )
+        y_prime[k] = ( y_k + a_t * y_prime[k-1] ) * beta
+    delta_w = y_prime[nk-1]
+    u[nk-1] += delta_w.real
     for k in range(nk-2, -1, -1):
-        x = ( rhs[k] - c_sup[k] * x ) / b_diag[k]
-        u[k] += x.real
+        delta_w = y_prime[k] + q[k] * delta_w
+        u[k] += delta_w.real
 
-    # v-point pass: solve for Δw, take Im for Δv.
+    # v-point pass: take Im(Δw) for Δv.
     ic_v = alpha_f * dt * f_at_v
-    for k in range(nk):
-        a_sub[k]  = -alpha_nu * dt * a_top_v[k] * rhv[k]
-        c_sup[k]  = -alpha_nu * dt * a_bot_v[k] * rhv[k]
-        b_diag[k] = ( 1.0 + alpha_nu * dt * ( a_top_v[k] + a_bot_v[k] ) * rhv[k] ) + 1j * ic_v
-        rhs[k]    = ( dt * udot_at_v[k] ) + 1j * ( dt * vdot[k] )
+    hc   = h_at_v[0] * ( 1.0 + 1j * ic_v )
+    a_t  = ( alpha_nu * dt ) * a_top_v[0]
+    a_b  = ( alpha_nu * dt ) * a_bot_v[0]
+    beta = 1.0 / ( hc + a_t + a_b )
+    q[0] = a_b * beta
+    Q    = hc * beta
+    y_prime[0] = h_at_v[0] * ( dt * udot_at_v[0] + 1j * ( dt * vdot[0] ) ) * beta
     for k in range(1, nk):
-        m = a_sub[k] / b_diag[k-1]
-        b_diag[k] -= m * c_sup[k-1]
-        rhs[k]    -= m * rhs[k-1]
-    x = rhs[nk-1] / b_diag[nk-1]
-    v[nk-1] += x.imag
+        a_t  = ( alpha_nu * dt ) * a_top_v[k]
+        a_b  = ( alpha_nu * dt ) * a_bot_v[k]
+        hc   = h_at_v[k] * ( 1.0 + 1j * ic_v )
+        beta = 1.0 / ( hc + a_t * Q + a_b )
+        q[k] = a_b * beta
+        Q    = ( hc + a_t * Q ) * beta
+        y_k  = h_at_v[k] * ( dt * udot_at_v[k] + 1j * ( dt * vdot[k] ) )
+        y_prime[k] = ( y_k + a_t * y_prime[k-1] ) * beta
+    delta_w = y_prime[nk-1]
+    v[nk-1] += delta_w.imag
     for k in range(nk-2, -1, -1):
-        x = ( rhs[k] - c_sup[k] * x ) / b_diag[k]
-        v[k] += x.imag
+        delta_w = y_prime[k] + q[k] * delta_w
+        v[k] += delta_w.imag
 
 
 class SSWEM:
