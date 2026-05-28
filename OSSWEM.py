@@ -434,10 +434,11 @@ class SSWEM:
         v_t = 0.0 if v_target is None else v_target
         self.u_target = np.broadcast_to(np.asarray(u_t, dtype=float), shape).copy()
         self.v_target = np.broadcast_to(np.asarray(v_t, dtype=float), shape).copy()
-        u_r = 0.0 if u_relax is None else u_relax
-        v_r = 0.0 if v_relax is None else v_relax
-        self.u_relax = np.broadcast_to(np.asarray(u_r, dtype=float), shape).copy()
-        self.v_relax = np.broadcast_to(np.asarray(v_r, dtype=float), shape).copy()
+        # Rates are routed through their property setters (below), which coerce
+        # to a (nk,nj,ni) float64 array and cache the on/off gate once, so the
+        # per-step .max() recomputation is avoided.
+        self.u_relax = u_relax
+        self.v_relax = v_relax
 
         # Derived parameters
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
@@ -473,6 +474,35 @@ class SSWEM:
             print("Res: Ld1/dx =",self.Ld1 / self.dx)
         if not self.beta==0:
             print("Res: Ls/dx =",self.Ls / self.dx)
+
+    def _set_relax(self, value):
+        """Coerce a relax rate (None / scalar / broadcastable array) to a
+        contiguous (nk,nj,ni) float64 array and return it together with its
+        on/off gate (True iff any rate is positive). The array is marked
+        read-only so the cached gate cannot silently desync: change a rate by
+        assigning a new value (e.g. M.u_relax = arr), which refreshes the gate,
+        not by mutating M.u_relax in place."""
+        r = 0.0 if value is None else value
+        arr = np.broadcast_to(np.asarray(r, dtype=float),
+                              (self.nk, self.nj, self.ni)).copy()
+        arr.flags.writeable = False
+        return arr, bool(arr.max() > 0)
+
+    @property
+    def u_relax(self):
+        return self._u_relax
+
+    @u_relax.setter
+    def u_relax(self, value):
+        self._u_relax, self._u_relax_on = self._set_relax(value)
+
+    @property
+    def v_relax(self):
+        return self._v_relax
+
+    @v_relax.setter
+    def v_relax(self, value):
+        self._v_relax, self._v_relax_on = self._set_relax(value)
 
     def resting_state(self):
         """Set state to resting (u=v=0). Distribute layer thicknesses so that
@@ -648,18 +678,16 @@ class SSWEM:
         """
         dt   - Time step [s]
         """
-        # Gate the velocity restoring on the Python side: a bool keeps the JIT
-        # argument types stable and lets numba skip the term when restoring is
-        # off (all rates zero / left at the None default).
-        u_relax_on = bool( self.u_relax.max() > 0 )
-        v_relax_on = bool( self.v_relax.max() > 0 )
+        # Velocity-restoring gates are cached by the u_relax/v_relax setters
+        # (a bool keeps the JIT argument types stable and lets numba skip the
+        # term when restoring is off), so no per-step recomputation is needed.
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v,
                     dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
                     self.alpha_f, self.alpha_nu,
                     self.h_target, self.u_target, self.v_target,
-                    self.h_relax, self.u_relax, self.v_relax,
-                    u_relax_on, v_relax_on, self.hsub, self.iter)
+                    self.h_relax, self._u_relax, self._v_relax,
+                    self._u_relax_on, self._v_relax_on, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
 
