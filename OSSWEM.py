@@ -1,5 +1,5 @@
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 
 # --- Numba-JIT shift helpers ---
@@ -345,64 +345,25 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
         v[k] += delta_w.imag
 
 
-@njit(cache=True)
-def _cont_i(h, u, hu, c):
-    """Fused i-direction continuity sub-step. Fills the upwinded zonal flux
-    hu = u_pos*h[i-1] + u_neg*h[i] (h read before any update), then updates
-    h -= c*(hu[i+1]-hu[i]) in place. c = dt/dx."""
-    nk, nj, ni = h.shape
-    for k in range(nk):
-        for j in range(nj):
-            for i in range(ni):
-                im = i - 1 if i > 0 else ni - 1
-                ui = u[k,j,i]
-                up = ui if ui > 0.0 else 0.0
-                un = ui if ui < 0.0 else 0.0
-                hu[k,j,i] = up * h[k,j,im] + un * h[k,j,i]
-    for k in range(nk):
-        for j in range(nj):
-            for i in range(ni):
-                ip = i + 1 if i < ni - 1 else 0
-                h[k,j,i] -= c * ( hu[k,j,ip] - hu[k,j,i] )
-
-@njit(cache=True)
-def _cont_j(h, v, hv, c):
-    """Fused j-direction continuity sub-step. Fills the upwinded meridional
-    flux hv = v_pos*h[j-1] + v_neg*h[j], then updates h -= c*(hv[j+1]-hv[j])
-    in place. c = dt/dy."""
-    nk, nj, ni = h.shape
-    for k in range(nk):
-        for j in range(nj):
-            jm = j - 1 if j > 0 else nj - 1
-            for i in range(ni):
-                vi = v[k,j,i]
-                vp = vi if vi > 0.0 else 0.0
-                vn = vi if vi < 0.0 else 0.0
-                hv[k,j,i] = vp * h[k,jm,i] + vn * h[k,j,i]
-    for k in range(nk):
-        for j in range(nj):
-            jp = j + 1 if j < nj - 1 else 0
-            for i in range(ni):
-                h[k,j,i] -= c * ( hv[k,jp,i] - hv[k,j,i] )
-
-
-@njit(cache=True)
-def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
-                      dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
-                      h_target, u_target, v_target,
-                      h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
-    """Fused variant of _step_numba (EXPERIMENTAL, evaluation only).
+def _step_fused_impl(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
+                     dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
+                     h_target, u_target, v_target,
+                     h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
+    """Fused implementation of the time step (EXPERIMENTAL). Shared body for
+    the serial (_step_numba_fused) and threaded (_step_numba_fused_par)
+    kernels: njit-compiled with parallel=False the prange loops run serially,
+    with parallel=True they run across threads (parallelized over j-rows,
+    which are independent so the loops are race-free).
 
     Same algorithm as _step_numba, but the helper-based array operations are
-    replaced by fused (k,j,i) loops that recompute stencil quantities inline,
-    eliminating their temporary allocations: pre-continuity hq, continuity
-    (via _cont_i/_cont_j), kinetic energy + Bernoulli + h-at-u/v reciprocals,
-    the explicit momentum accelerations (PV Coriolis fluxes, Bernoulli
-    gradient, viscous stress divergence), and the TDMAH2 input averaging. The
-    interfacial-stress coefficients, the explicit -(L u) term, and the
-    cancellation-free TDMAH2 implicit solve remain as in the reference.
-    Per-cell expressions keep the reference's arithmetic grouping, so results
-    agree to roundoff (verify before trusting)."""
+    replaced by fused loops that recompute stencil quantities inline,
+    eliminating their temporary allocations: pre-continuity hq, continuity,
+    kinetic energy + Bernoulli + h-at-u/v reciprocals, the explicit momentum
+    accelerations (PV Coriolis fluxes, Bernoulli gradient, viscous stress
+    divergence), the TDMAH2 input averaging, and the solver tail (interfacial
+    coefficients computed inline as scalars; the cancellation-free TDMAH2
+    recurrence run per column with scalar locals). Per-cell expressions keep
+    the reference's arithmetic grouping, so results agree to roundoff."""
     nk, nj, ni = u.shape
     rdx = 1 / dx
     rdy = 1 / dy
@@ -420,7 +381,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     # an array because PV is needed at several q-points. Fused u2q(h2u(h)).
     hq_pre = np.empty((nk, nj, ni))
     for k in range(nk):
-        for j in range(nj):
+        for j in prange(nj):
             jm = j - 1 if j > 0 else nj - 1
             for i in range(ni):
                 im = i - 1 if i > 0 else ni - 1
@@ -432,12 +393,40 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     # place; the second sub-step sees the h updated by the first.
     hu = np.empty((nk, nj, ni))
     hv = np.empty((nk, nj, ni))
-    if iter_num % 2 == 0:
-        _cont_i(h, u, hu, dt * rdx)
-        _cont_j(h, v, hv, dt * rdy)
-    else:
-        _cont_j(h, v, hv, dt * rdy)
-        _cont_i(h, u, hu, dt * rdx)
+    cx = dt * rdx
+    cy = dt * rdy
+    do_i_first = ( iter_num % 2 == 0 )
+    for sweep in range(2):
+        if ( sweep == 0 ) == do_i_first:
+            # i-direction: hu = u_pos*h[i-1] + u_neg*h[i]; h -= cx*(hu[i+1]-hu[i]).
+            for k in range(nk):
+                for j in prange(nj):
+                    for i in range(ni):
+                        im = i - 1 if i > 0 else ni - 1
+                        ui = u[k,j,i]
+                        up = ui if ui > 0.0 else 0.0
+                        un = ui if ui < 0.0 else 0.0
+                        hu[k,j,i] = up * h[k,j,im] + un * h[k,j,i]
+            for k in range(nk):
+                for j in prange(nj):
+                    for i in range(ni):
+                        ip = i + 1 if i < ni - 1 else 0
+                        h[k,j,i] -= cx * ( hu[k,j,ip] - hu[k,j,i] )
+        else:
+            # j-direction: hv = v_pos*h[j-1] + v_neg*h[j]; h -= cy*(hv[j+1]-hv[j]).
+            for k in range(nk):
+                for j in prange(nj):
+                    jm = j - 1 if j > 0 else nj - 1
+                    for i in range(ni):
+                        vi = v[k,j,i]
+                        vp = vi if vi > 0.0 else 0.0
+                        vn = vi if vi < 0.0 else 0.0
+                        hv[k,j,i] = vp * h[k,jm,i] + vn * h[k,j,i]
+            for k in range(nk):
+                for j in prange(nj):
+                    jp = j + 1 if j < nj - 1 else 0
+                    for i in range(ni):
+                        h[k,j,i] -= cy * ( hv[k,jp,i] - hv[k,j,i] )
 
     # Interface positions eta (cumulative from bottom) and Montgomery potential
     # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
@@ -459,7 +448,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     rhu = np.empty((nk, nj, ni))
     rhv = np.empty((nk, nj, ni))
     for k in range(nk):
-        for j in range(nj):
+        for j in prange(nj):
             jm = j - 1 if j > 0 else nj - 1
             jp = j + 1 if j < nj - 1 else 0
             for i in range(ni):
@@ -480,7 +469,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     udot = np.empty((nk, nj, ni))
     vdot = np.empty((nk, nj, ni))
     for k in range(nk):
-        for j in range(nj):
+        for j in prange(nj):
             jm = j - 1 if j > 0 else nj - 1
             jp = j + 1 if j < nj - 1 else 0
             for i in range(ni):
@@ -545,7 +534,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     # bottom (k=nk-1) = epsilon. (L u)_k = ((a_top+a_bot) u_k - a_top u_{k-1}
     # - a_bot u_{k+1}) / h_k.
     adt = alpha_nu * dt
-    for j in range(nj):
+    for j in prange(nj):
         for i in range(ni):
             for k in range(nk):
                 atu = 0.0 if k == 0 else 2.0 * nu_v / ( h_at_u[k-1,j,i] + h_at_u[k,j,i] + hsub )
@@ -570,7 +559,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     vdot_at_u = np.empty((nk, nj, ni))
     udot_at_v = np.empty((nk, nj, ni))
     for k in range(nk):
-        for j in range(nj):
+        for j in prange(nj):
             jm = j - 1 if j > 0 else nj - 1
             jp = j + 1 if j < nj - 1 else 0
             for i in range(ni):
@@ -587,7 +576,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     y_prime = np.empty((nk, nj, ni), dtype=np.complex128)
 
     # u-point pass: take Re(delta_w) for delta_u.
-    for j in range(nj):
+    for j in prange(nj):
         for i in range(ni):
             ic = alpha_f * dt * f_at_u[j,i]
             hc   = h_at_u[0,j,i] * ( 1.0 + 1j * ic )
@@ -612,7 +601,7 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 u[k,j,i] += delta_w.real
 
     # v-point pass: take Im(delta_w) for delta_v.
-    for j in range(nj):
+    for j in prange(nj):
         for i in range(ni):
             ic = alpha_f * dt * f_at_v[j,i]
             hc   = h_at_v[0,j,i] * ( 1.0 + 1j * ic )
@@ -635,6 +624,16 @@ def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
             for k in range(nk-2, -1, -1):
                 delta_w = y_prime[k,j,i] + q[k,j,i] * delta_w
                 v[k,j,i] += delta_w.imag
+
+
+# Two compilations of the shared fused body. Serial: prange acts as range.
+# Parallel: prange loops over j-rows run across numba threads (set the count
+# with numba.set_num_threads(); this is a memory-bandwidth-bound stencil, so
+# the sweet spot is the physical core count, not the SMT thread count).
+# parallel=True is left uncached because two Dispatchers compiled from one
+# py_func would otherwise share a cache key.
+_step_numba_fused     = njit(cache=True)(_step_fused_impl)
+_step_numba_fused_par = njit(parallel=True)(_step_fused_impl)
 
 
 class SSWEM:
@@ -668,6 +667,13 @@ class SSWEM:
         v_target - Target meridional velocity field [m s-1] relaxed to when v_relax>0.
                   Scalar or any array broadcastable to (nk, nj, ni). Defaults to 0.
         hsub    - H sub-roundoff [m]
+        fused   - EXPERIMENTAL time-step kernel selector (default False).
+                  False      -> reference vectorized kernel (_step_numba).
+                  True       -> serial fused single-loop kernel.
+                  'parallel' -> threaded fused kernel (prange over j-rows).
+                  The fused kernels agree with the reference to roundoff; the
+                  parallel one scales best at the physical core count (set via
+                  numba.set_num_threads()).
         """
         self.ni = ni
         self.g = np.atleast_1d(np.asarray(g, dtype=float)).copy()
@@ -676,7 +682,12 @@ class SSWEM:
         if self.Ho.size != self.nk:
             raise ValueError(f"Ho must have length nk={self.nk}, got {self.Ho.size}")
         self.h_relax = float(h_relax)
-        self.fused = bool(fused)  # EXPERIMENTAL: use the fused single-loop kernel
+        # EXPERIMENTAL kernel selection: False -> reference _step_numba;
+        # True -> serial fused; 'parallel' -> threaded fused (prange over
+        # j-rows; set thread count with numba.set_num_threads()).
+        if fused not in (False, True, 'parallel'):
+            raise ValueError("fused must be False, True, or 'parallel'")
+        self.fused = fused
         self.Lx = Lx
         self.fo = fo
         self.beta = beta
@@ -975,7 +986,12 @@ class SSWEM:
         # Velocity-restoring gates are cached by the u_relax/v_relax setters
         # (a bool keeps the JIT argument types stable and lets numba skip the
         # term when restoring is off), so no per-step recomputation is needed.
-        kernel = _step_numba_fused if self.fused else _step_numba
+        if self.fused == 'parallel':
+            kernel = _step_numba_fused_par
+        elif self.fused:
+            kernel = _step_numba_fused
+        else:
+            kernel = _step_numba
         kernel(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                self.f, self.f_at_u, self.f_at_v,
                dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
