@@ -345,11 +345,304 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
         v[k] += delta_w.imag
 
 
+@njit(cache=True)
+def _cont_i(h, u, hu, c):
+    """Fused i-direction continuity sub-step. Fills the upwinded zonal flux
+    hu = u_pos*h[i-1] + u_neg*h[i] (h read before any update), then updates
+    h -= c*(hu[i+1]-hu[i]) in place. c = dt/dx."""
+    nk, nj, ni = h.shape
+    for k in range(nk):
+        for j in range(nj):
+            for i in range(ni):
+                im = i - 1 if i > 0 else ni - 1
+                ui = u[k,j,i]
+                up = ui if ui > 0.0 else 0.0
+                un = ui if ui < 0.0 else 0.0
+                hu[k,j,i] = up * h[k,j,im] + un * h[k,j,i]
+    for k in range(nk):
+        for j in range(nj):
+            for i in range(ni):
+                ip = i + 1 if i < ni - 1 else 0
+                h[k,j,i] -= c * ( hu[k,j,ip] - hu[k,j,i] )
+
+@njit(cache=True)
+def _cont_j(h, v, hv, c):
+    """Fused j-direction continuity sub-step. Fills the upwinded meridional
+    flux hv = v_pos*h[j-1] + v_neg*h[j], then updates h -= c*(hv[j+1]-hv[j])
+    in place. c = dt/dy."""
+    nk, nj, ni = h.shape
+    for k in range(nk):
+        for j in range(nj):
+            jm = j - 1 if j > 0 else nj - 1
+            for i in range(ni):
+                vi = v[k,j,i]
+                vp = vi if vi > 0.0 else 0.0
+                vn = vi if vi < 0.0 else 0.0
+                hv[k,j,i] = vp * h[k,jm,i] + vn * h[k,j,i]
+    for k in range(nk):
+        for j in range(nj):
+            jp = j + 1 if j < nj - 1 else 0
+            for i in range(ni):
+                h[k,j,i] -= c * ( hv[k,jp,i] - hv[k,j,i] )
+
+
+@njit(cache=True)
+def _step_numba_fused(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
+                      dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
+                      h_target, u_target, v_target,
+                      h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
+    """Fused variant of _step_numba (EXPERIMENTAL, evaluation only).
+
+    Same algorithm as _step_numba, but the helper-based array operations are
+    replaced by fused (k,j,i) loops that recompute stencil quantities inline,
+    eliminating their temporary allocations: pre-continuity hq, continuity
+    (via _cont_i/_cont_j), kinetic energy + Bernoulli + h-at-u/v reciprocals,
+    the explicit momentum accelerations (PV Coriolis fluxes, Bernoulli
+    gradient, viscous stress divergence), and the TDMAH2 input averaging. The
+    interfacial-stress coefficients, the explicit -(L u) term, and the
+    cancellation-free TDMAH2 implicit solve remain as in the reference.
+    Per-cell expressions keep the reference's arithmetic grouping, so results
+    agree to roundoff (verify before trusting)."""
+    nk, nj, ni = u.shape
+    rdx = 1 / dx
+    rdy = 1 / dy
+
+    # --- restoring (identical to reference) ---
+    if h_relax > 0:
+        h_dev = h[0].sum(axis=-1) / ni - h_target[0, :]
+        h[0] -= ( dt * h_relax ) * h_dev.reshape(nj, 1)
+    if u_relax_on:
+        u -= ( dt * u_relax ) * ( u - u_target )
+    if v_relax_on:
+        v -= ( dt * v_relax ) * ( v - v_target )
+
+    # Pre-continuity hq at q-points (used for PV in the explicit loop); kept as
+    # an array because PV is needed at several q-points. Fused u2q(h2u(h)).
+    hq_pre = np.empty((nk, nj, ni))
+    for k in range(nk):
+        for j in range(nj):
+            jm = j - 1 if j > 0 else nj - 1
+            for i in range(ni):
+                im = i - 1 if i > 0 else ni - 1
+                hq_pre[k,j,i] = 0.5 * ( 0.5 * ( h[k,j,i]  + h[k,j,im]  )
+                                      + 0.5 * ( h[k,jm,i] + h[k,jm,im] ) )
+
+    # Continuity: order-sensitive directional split. Each sub-step computes its
+    # upwinded flux (hu/hv, retained for the PV fluxes below) then updates h in
+    # place; the second sub-step sees the h updated by the first.
+    hu = np.empty((nk, nj, ni))
+    hv = np.empty((nk, nj, ni))
+    if iter_num % 2 == 0:
+        _cont_i(h, u, hu, dt * rdx)
+        _cont_j(h, v, hv, dt * rdy)
+    else:
+        _cont_j(h, v, hv, dt * rdy)
+        _cont_i(h, u, hu, dt * rdx)
+
+    # Interface positions eta (cumulative from bottom) and Montgomery potential
+    # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
+    eta = np.empty_like(h)
+    eta[nk-1] = h[nk-1] - D
+    for k in range(nk-2, -1, -1):
+        eta[k] = eta[k+1] + h[k]
+    M = np.empty_like(h)
+    M[0] = g[0] * eta[0]
+    for k in range(1, nk):
+        M[k] = M[k-1] + g[k] * eta[k]
+
+    # Fused: Bernoulli B = M + KE, post-continuity h at u/v points and their
+    # reciprocals (reused by the explicit loop, the interfacial coefficients,
+    # and the TDMAH2 solve). KE uses the upwind-signed velocities inline.
+    B = np.empty((nk, nj, ni))
+    h_at_u = np.empty((nk, nj, ni))
+    h_at_v = np.empty((nk, nj, ni))
+    rhu = np.empty((nk, nj, ni))
+    rhv = np.empty((nk, nj, ni))
+    for k in range(nk):
+        for j in range(nj):
+            jm = j - 1 if j > 0 else nj - 1
+            jp = j + 1 if j < nj - 1 else 0
+            for i in range(ni):
+                im = i - 1 if i > 0 else ni - 1
+                ip = i + 1 if i < ni - 1 else 0
+                ui = u[k,j,i];   up    = ui  if ui  > 0.0 else 0.0
+                uip = u[k,j,ip]; un_ip = uip if uip < 0.0 else 0.0
+                vi = v[k,j,i];   vp    = vi  if vi  > 0.0 else 0.0
+                vjp = v[k,jp,i]; vn_jp = vjp if vjp < 0.0 else 0.0
+                kin = 0.5 * ( up*up + un_ip*un_ip ) + 0.5 * ( vp*vp + vn_jp*vn_jp )
+                B[k,j,i] = M[k,j,i] + kin
+                hau = 0.5 * ( h[k,j,i] + h[k,j,im] )
+                hav = 0.5 * ( h[k,j,i] + h[k,jm,i] )
+                h_at_u[k,j,i] = hau; rhu[k,j,i] = 1.0 / ( hau + hsub )
+                h_at_v[k,j,i] = hav; rhv[k,j,i] = 1.0 / ( hav + hsub )
+
+    # --- FUSED explicit accelerations: udot, vdot in one pass ---
+    udot = np.empty((nk, nj, ni))
+    vdot = np.empty((nk, nj, ni))
+    for k in range(nk):
+        for j in range(nj):
+            jm = j - 1 if j > 0 else nj - 1
+            jp = j + 1 if j < nj - 1 else 0
+            for i in range(ni):
+                im = i - 1 if i > 0 else ni - 1
+                ip = i + 1 if i < ni - 1 else 0
+
+                # Masked PV at q-points (j,i), (jp,i), (j,ip):
+                #   q = (f + vx - uy) ; q *= r ; q *= (hqp*r),  r = 1/(hqp+hsub)
+                vort_c  = f[j, i]  + ( v[k,j,i]  - v[k,j,im]  ) * rdx - ( u[k,j,i]  - u[k,jm,i]  ) * rdy
+                r_c     = 1.0 / ( hq_pre[k,j,i] + hsub )
+                qpv_c   = ( vort_c * r_c ) * ( hq_pre[k,j,i] * r_c )
+                vort_jp = f[jp, i] + ( v[k,jp,i] - v[k,jp,im] ) * rdx - ( u[k,jp,i] - u[k,j,i]   ) * rdy
+                r_jp    = 1.0 / ( hq_pre[k,jp,i] + hsub )
+                qpv_jp  = ( vort_jp * r_jp ) * ( hq_pre[k,jp,i] * r_jp )
+                vort_ip = f[j, ip] + ( v[k,j,ip] - v[k,j,i]   ) * rdx - ( u[k,j,ip] - u[k,jm,ip] ) * rdy
+                r_ip    = 1.0 / ( hq_pre[k,j,ip] + hsub )
+                qpv_ip  = ( vort_ip * r_ip ) * ( hq_pre[k,j,ip] * r_ip )
+
+                # Bernoulli gradient.
+                Bx = ( B[k,j,i] - B[k,j,im] ) * rdx
+                By = ( B[k,j,i] - B[k,jm,i] ) * rdy
+
+                # PV Coriolis fluxes (q2u/v2q and q2v/u2q expanded).
+                qhv = 0.5 * ( qpv_c  * 0.5 * ( hv[k,j,i]  + hv[k,j,im]  )
+                            + qpv_jp * 0.5 * ( hv[k,jp,i] + hv[k,jp,im] ) )
+                qhu = 0.5 * ( qpv_c  * 0.5 * ( hu[k,j,i]  + hu[k,jm,i]  )
+                            + qpv_ip * 0.5 * ( hu[k,j,ip] + hu[k,jm,ip] ) )
+
+                # Stress tensor: nu*h*D_tension at h-points {(j,i),(j,im),(jm,i)};
+                # nu*hq*D_shear at q-points {(j,i),(jp,i),(j,ip)}.
+                Dt_c  = ( u[k,j,ip] - u[k,j,i]  ) * rdx - ( v[k,jp,i] - v[k,j,i]  ) * rdy
+                nuhDt_c  = nu * h[k,j,i]  * Dt_c
+                Dt_im = ( u[k,j,i]  - u[k,j,im] ) * rdx - ( v[k,jp,im]- v[k,j,im] ) * rdy
+                nuhDt_im = nu * h[k,j,im] * Dt_im
+                Dt_jm = ( u[k,jm,ip]- u[k,jm,i] ) * rdx - ( v[k,j,i]  - v[k,jm,i] ) * rdy
+                nuhDt_jm = nu * h[k,jm,i] * Dt_jm
+
+                Ds_c  = ( u[k,j,i]  - u[k,jm,i] ) * rdy + ( v[k,j,i]  - v[k,j,im]  ) * rdx
+                hqp_c  = min( min( h[k,j,i],  h[k,j,im]  ), min( h[k,jm,i], h[k,jm,im] ) )
+                nuhqDs_c  = nu * hqp_c  * Ds_c
+                Ds_jp = ( u[k,jp,i] - u[k,j,i]  ) * rdy + ( v[k,jp,i] - v[k,jp,im] ) * rdx
+                hqp_jp = min( min( h[k,jp,i], h[k,jp,im] ), min( h[k,j,i],  h[k,j,im]  ) )
+                nuhqDs_jp = nu * hqp_jp * Ds_jp
+                Ds_ip = ( u[k,j,ip] - u[k,jm,ip]) * rdy + ( v[k,j,ip] - v[k,j,i]   ) * rdx
+                hqp_ip = min( min( h[k,j,ip], h[k,j,i]   ), min( h[k,jm,ip],h[k,jm,i]  ) )
+                nuhqDs_ip = nu * hqp_ip * Ds_ip
+
+                uxxyy = ( ( nuhDt_c - nuhDt_im ) * rdx + ( nuhqDs_jp - nuhqDs_c ) * rdy ) * rhu[k,j,i]
+                vxxyy = ( ( nuhqDs_ip - nuhqDs_c ) * rdx - ( nuhDt_c - nuhDt_jm ) * rdy ) * rhv[k,j,i]
+
+                ud = ( qhv - Bx ) + uxxyy
+                vd = - ( qhu + By ) + vxxyy
+                if k == 0:
+                    ud += taux[j,i] * rhu[0,j,i]
+                    vd += tauy[j,i] * rhv[0,j,i]
+                udot[k,j,i] = ud
+                vdot[k,j,i] = vd
+
+    # --- explicit -(L u^n), -(L v^n), per column ---
+    # Interfacial-stress coefficients are recomputed inline as scalars (no
+    # a_top/a_bot arrays): a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) interior, top = 0,
+    # bottom (k=nk-1) = epsilon. (L u)_k = ((a_top+a_bot) u_k - a_top u_{k-1}
+    # - a_bot u_{k+1}) / h_k.
+    adt = alpha_nu * dt
+    for j in range(nj):
+        for i in range(ni):
+            for k in range(nk):
+                atu = 0.0 if k == 0 else 2.0 * nu_v / ( h_at_u[k-1,j,i] + h_at_u[k,j,i] + hsub )
+                abu = epsilon if k == nk-1 else 2.0 * nu_v / ( h_at_u[k,j,i] + h_at_u[k+1,j,i] + hsub )
+                atv = 0.0 if k == 0 else 2.0 * nu_v / ( h_at_v[k-1,j,i] + h_at_v[k,j,i] + hsub )
+                abv = epsilon if k == nk-1 else 2.0 * nu_v / ( h_at_v[k,j,i] + h_at_v[k+1,j,i] + hsub )
+                Lu = ( atu + abu ) * u[k,j,i]
+                Lv = ( atv + abv ) * v[k,j,i]
+                if k > 0:
+                    Lu -= atu * u[k-1,j,i]
+                    Lv -= atv * v[k-1,j,i]
+                if k < nk - 1:
+                    Lu -= abu * u[k+1,j,i]
+                    Lv -= abv * v[k+1,j,i]
+                udot[k,j,i] -= Lu * rhu[k,j,i]
+                vdot[k,j,i] -= Lv * rhv[k,j,i]
+
+    # --- implicit TDMAH2 (cancellation-free; recurrence identical to reference,
+    # done per column with scalar locals) ---
+    # Fused interpolation of the cross-component accelerations: vdot to
+    # u-points = q2u(v2q(vdot)), udot to v-points = q2v(u2q(udot)).
+    vdot_at_u = np.empty((nk, nj, ni))
+    udot_at_v = np.empty((nk, nj, ni))
+    for k in range(nk):
+        for j in range(nj):
+            jm = j - 1 if j > 0 else nj - 1
+            jp = j + 1 if j < nj - 1 else 0
+            for i in range(ni):
+                im = i - 1 if i > 0 else ni - 1
+                ip = i + 1 if i < ni - 1 else 0
+                vdot_at_u[k,j,i] = 0.5 * ( 0.5 * ( vdot[k,j,i]  + vdot[k,j,im]  )
+                                         + 0.5 * ( vdot[k,jp,i] + vdot[k,jp,im] ) )
+                udot_at_v[k,j,i] = 0.5 * ( 0.5 * ( udot[k,j,i]  + udot[k,jm,i]  )
+                                         + 0.5 * ( udot[k,j,ip] + udot[k,jm,ip] ) )
+
+    # q and y_prime hold the per-column forward-sweep ratios; kept as arrays so
+    # the backward sweep can read them (and so the loops stay prange-safe).
+    q       = np.empty((nk, nj, ni), dtype=np.complex128)
+    y_prime = np.empty((nk, nj, ni), dtype=np.complex128)
+
+    # u-point pass: take Re(delta_w) for delta_u.
+    for j in range(nj):
+        for i in range(ni):
+            ic = alpha_f * dt * f_at_u[j,i]
+            hc   = h_at_u[0,j,i] * ( 1.0 + 1j * ic )
+            a_b  = adt * ( epsilon if nk == 1 else 2.0 * nu_v / ( h_at_u[0,j,i] + h_at_u[1,j,i] + hsub ) )
+            beta = 1.0 / ( hc + a_b )            # a_top[0] = 0
+            q[0,j,i] = a_b * beta
+            Q    = hc * beta
+            y_prime[0,j,i] = h_at_u[0,j,i] * ( dt * udot[0,j,i] + 1j * ( dt * vdot_at_u[0,j,i] ) ) * beta
+            for k in range(1, nk):
+                a_t  = adt * ( 2.0 * nu_v / ( h_at_u[k-1,j,i] + h_at_u[k,j,i] + hsub ) )
+                a_b  = adt * ( epsilon if k == nk-1 else 2.0 * nu_v / ( h_at_u[k,j,i] + h_at_u[k+1,j,i] + hsub ) )
+                hc   = h_at_u[k,j,i] * ( 1.0 + 1j * ic )
+                beta = 1.0 / ( hc + a_t * Q + a_b )
+                q[k,j,i] = a_b * beta
+                Q    = ( hc + a_t * Q ) * beta
+                y_k  = h_at_u[k,j,i] * ( dt * udot[k,j,i] + 1j * ( dt * vdot_at_u[k,j,i] ) )
+                y_prime[k,j,i] = ( y_k + a_t * y_prime[k-1,j,i] ) * beta
+            delta_w = y_prime[nk-1,j,i]
+            u[nk-1,j,i] += delta_w.real
+            for k in range(nk-2, -1, -1):
+                delta_w = y_prime[k,j,i] + q[k,j,i] * delta_w
+                u[k,j,i] += delta_w.real
+
+    # v-point pass: take Im(delta_w) for delta_v.
+    for j in range(nj):
+        for i in range(ni):
+            ic = alpha_f * dt * f_at_v[j,i]
+            hc   = h_at_v[0,j,i] * ( 1.0 + 1j * ic )
+            a_b  = adt * ( epsilon if nk == 1 else 2.0 * nu_v / ( h_at_v[0,j,i] + h_at_v[1,j,i] + hsub ) )
+            beta = 1.0 / ( hc + a_b )
+            q[0,j,i] = a_b * beta
+            Q    = hc * beta
+            y_prime[0,j,i] = h_at_v[0,j,i] * ( dt * udot_at_v[0,j,i] + 1j * ( dt * vdot[0,j,i] ) ) * beta
+            for k in range(1, nk):
+                a_t  = adt * ( 2.0 * nu_v / ( h_at_v[k-1,j,i] + h_at_v[k,j,i] + hsub ) )
+                a_b  = adt * ( epsilon if k == nk-1 else 2.0 * nu_v / ( h_at_v[k,j,i] + h_at_v[k+1,j,i] + hsub ) )
+                hc   = h_at_v[k,j,i] * ( 1.0 + 1j * ic )
+                beta = 1.0 / ( hc + a_t * Q + a_b )
+                q[k,j,i] = a_b * beta
+                Q    = ( hc + a_t * Q ) * beta
+                y_k  = h_at_v[k,j,i] * ( dt * udot_at_v[k,j,i] + 1j * ( dt * vdot[k,j,i] ) )
+                y_prime[k,j,i] = ( y_k + a_t * y_prime[k-1,j,i] ) * beta
+            delta_w = y_prime[nk-1,j,i]
+            v[nk-1,j,i] += delta_w.imag
+            for k in range(nk-2, -1, -1):
+                delta_w = y_prime[k,j,i] + q[k,j,i] * delta_w
+                v[k,j,i] += delta_w.imag
+
+
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
     def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
-                 h_relax=0, u_relax=None, v_relax=None, u_target=None, v_target=None, hsub=1e-12):
+                 h_relax=0, u_relax=None, v_relax=None, u_target=None, v_target=None,
+                 hsub=1e-12, fused=False):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -383,6 +676,7 @@ class SSWEM:
         if self.Ho.size != self.nk:
             raise ValueError(f"Ho must have length nk={self.nk}, got {self.Ho.size}")
         self.h_relax = float(h_relax)
+        self.fused = bool(fused)  # EXPERIMENTAL: use the fused single-loop kernel
         self.Lx = Lx
         self.fo = fo
         self.beta = beta
@@ -681,13 +975,14 @@ class SSWEM:
         # Velocity-restoring gates are cached by the u_relax/v_relax setters
         # (a bool keeps the JIT argument types stable and lets numba skip the
         # term when restoring is off), so no per-step recomputation is needed.
-        _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
-                    self.f, self.f_at_u, self.f_at_v,
-                    dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
-                    self.alpha_f, self.alpha_nu,
-                    self.h_target, self.u_target, self.v_target,
-                    self.h_relax, self._u_relax, self._v_relax,
-                    self._u_relax_on, self._v_relax_on, self.hsub, self.iter)
+        kernel = _step_numba_fused if self.fused else _step_numba
+        kernel(self.u, self.v, self.h, self.D, self.taux, self.tauy,
+               self.f, self.f_at_u, self.f_at_v,
+               dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
+               self.alpha_f, self.alpha_nu,
+               self.h_target, self.u_target, self.v_target,
+               self.h_relax, self._u_relax, self._v_relax,
+               self._u_relax_on, self._v_relax_on, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
 
