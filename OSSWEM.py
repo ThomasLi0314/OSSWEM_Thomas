@@ -1,5 +1,5 @@
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, get_num_threads
 
 
 # --- Numba-JIT shift helpers ---
@@ -44,34 +44,14 @@ def _nb_h2u(a):
     return 0.5 * ( a + _nb_im1(a) )
 
 @njit(cache=True)
-def _nb_v2q(a):
-    """Averages from v- to q- points."""
-    return 0.5 * ( a + _nb_im1(a) )
-
-@njit(cache=True)
-def _nb_u2h(a):
-    """Averages from u- to h- points. Also does q- to v-."""
-    return 0.5 * ( a + _nb_ip1(a) )
-
-@njit(cache=True)
 def _nb_q2v(a):
     """Averages from q- to v- points."""
     return 0.5 * ( a + _nb_ip1(a) )
 
 @njit(cache=True)
-def _nb_h2v(a):
-    """Averages from h- to v- points. Also does u- to q-."""
-    return 0.5 * ( a + _nb_jm1(a) )
-
-@njit(cache=True)
 def _nb_u2q(a):
     """Averages from u- to q- points."""
     return 0.5 * ( a + _nb_jm1(a) )
-
-@njit(cache=True)
-def _nb_v2h(a):
-    """Averages from v- to h- points. Also does q- to u-."""
-    return 0.5 * ( a + _nb_jp1(a) )
 
 @njit(cache=True)
 def _nb_q2u(a):
@@ -86,31 +66,9 @@ def _nb_dih(a):
     return a - _nb_im1(a)
 
 @njit(cache=True)
-def _nb_diu(a):
-    """Difference u- points to h- points. Also does q- to v-."""
-    return _nb_ip1(a) - a
-
-@njit(cache=True)
 def _nb_djh(a):
     """Difference h- points to v- points. Also does u- to q-."""
     return a - _nb_jm1(a)
-
-@njit(cache=True)
-def _nb_djv(a):
-    """Difference v- points to h- points. Also does q- to u-."""
-    return _nb_jp1(a) - a
-
-# --- Numba-JIT minimum helpers ---
-
-@njit(cache=True)
-def _nb_minh2u(a):
-    """Minimum from h- to u- points. Also does v- to q-."""
-    return np.minimum( a, _nb_im1(a) )
-
-@njit(cache=True)
-def _nb_minh2v(a):
-    """Minimum from h- to v- points. Also does u- to q-."""
-    return np.minimum( a, _nb_jm1(a) )
 
 # --- Numba-JIT physical functions ---
 
@@ -119,251 +77,31 @@ def _nb_vxuy(u, v, rdx, rdy):
     """Calculate components of relative vorticity"""
     return _nb_dih( v ) * rdx, _nb_djh( u ) * rdy
 
-# --- Numba-JIT step function ---
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
                 h_target, u_target, v_target,
                 h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
-    """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
-    is the prognostic; eta = h - D is diagnosed where needed (pressure gradient).
-    State arrays u, v, h have shape (nk, nj, ni). g is a length-nk vector.
-    h_target has shape (nk, nj) and gives the target zonal-mean thickness per
-    layer per row. h_relax is a scalar; restoring acts on layer 0 only. Inverse
-    layer thicknesses are taken from the prognostic h (with +hsub to guard
-    division), not from any nominal/reference thickness.
-    Interior vertical viscosity (nu_v) and bottom drag (epsilon) together form a
-    per-column tridiagonal vertical-diffusion operator L; both are time-weighted
-    by alpha_nu (1 = Euler backward, 0 = explicit). The implicit step solves the
-    K-element coupled tridiagonal+Coriolis system per (i,j) via Hallberg's
-    cancellation-free TDMAH2 recurrence: rows are first scaled by their layer
-    thickness h_k to symmetrize the matrix (removing all 1/h_k factors) and to
-    bundle the Coriolis term as h_k(1+ic). The forward sweep maintains running
-    ratios q_k = a_{k+1/2}*beta and Q_k = (h_k(1+ic)+a_{k-1/2}*Q_{k-1})*beta
-    with beta_k = 1/(h_k(1+ic) + a_{k-1/2}*Q_{k-1} + a_{k+1/2}); every
-    denominator is a sum of nonnegative-real plus complex terms with positive
-    real part, so the algorithm is robust as h_k -> 0. Re(Δw) gives Δu at
-    u-points; Im(Δw) gives Δv at v-points."""
-    nk, nj, ni = u.shape
-
-    rdx = 1 / dx
-    rdy = 1 / dy
-
-    # Restoring on layer 0: relax zonal-mean h[0] toward h_target[0, :].
-    if h_relax > 0:
-        h_dev = h[0].sum(axis=-1) / ni - h_target[0, :]
-        h[0] -= ( dt * h_relax ) * h_dev.reshape(nj, 1)
-
-    # Restoring of velocities toward prescribed target patterns (full field,
-    # all layers). Explicit (operator-split) Euler step applied before the
-    # dynamics so the rest of the step sees the relaxed u, v. Stable while
-    # dt*u_relax <= 1. u_relax, v_relax, u_target, v_target all have the same
-    # shape as u, v; the u_relax_on / v_relax_on booleans (precomputed on the
-    # Python side) gate the term so it is skipped entirely when restoring is
-    # off, and avoid an ambiguous truth test on the array rate.
-    if u_relax_on:
-        u -= ( dt * u_relax ) * ( u - u_target )
-    if v_relax_on:
-        v -= ( dt * v_relax ) * ( v - v_target )
-
-    # Cache upwind-signed velocities (u,v are unchanged until end of step)
-    u_pos = np.maximum( u, 0.0 )
-    u_neg = np.minimum( u, 0.0 )
-    v_pos = np.maximum( v, 0.0 )
-    v_neg = np.minimum( v, 0.0 )
-
-    # Pre-continuity hq (used for PV in the momentum step below)
-    hq = _nb_u2q( _nb_h2u( h ) )
-
-    # Continuity: integrate h directly via alternating directional split
-    if iter_num % 2 == 0:
-        hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
-        h -= ( dt * rdx ) * _nb_diu( hu )
-        hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
-        h -= ( dt * rdy ) * _nb_djv( hv )
-    else:
-        hv = v_pos * _nb_jm1( h ) + v_neg * h # Upwinded h*v on southern edge
-        h -= ( dt * rdy ) * _nb_djv( hv )
-        hu = u_pos * _nb_im1( h ) + u_neg * h # Upwinded h*u on western edge
-        h -= ( dt * rdx ) * _nb_diu( hu )
-
-    # Explicit accelerations
-    uip1_neg = _nb_ip1( u_neg )
-    vjp1_neg = _nb_jp1( v_neg )
-    # Enquist-Oscher 1/2 ( u^2 + v^2 )
-    K = 0.5 * ( u_pos**2 + uip1_neg**2 )
-    K += 0.5 * ( v_pos**2 + vjp1_neg**2 )
-    # Interface positions eta[k] = -D + sum_{l=k}^{nk-1} h[l]  (cumulative from bottom)
-    eta = np.empty_like(h)
-    eta[nk-1] = h[nk-1] - D
-    for k in range(nk-2, -1, -1):
-        eta[k] = eta[k+1] + h[k]
-    # Montgomery potential M[k] = sum_{l=0}^{k} g[l] * eta[l]  (cumulative from top)
-    M = np.empty_like(h)
-    M[0] = g[0] * eta[0]
-    for k in range(1, nk):
-        M[k] = M[k-1] + g[k] * eta[k]
-    B = M + K # Bernoulli = potential + KE
-
-    # Gradient of Bernoulli
-    Bx = _nb_dih( B ) * rdx
-    By = _nb_djh( B ) * rdy
-
-    # Components of relative vorticity and stress tensor
-    # vx = _nb_dih( v ) * rdx
-    # uy = _nb_djh( u ) * rdy
-    vx, uy = _nb_vxuy(u, v, rdx, rdy)
-    vy = _nb_djv( v ) * rdy
-    ux = _nb_diu( u ) * rdx
-
-    # Potential vorticity
-    q = f + ( vx - uy )
-    recip_hq_plus_hsub = 1.0 / ( hq + hsub )
-    q *= recip_hq_plus_hsub
-    q *= ( hq * recip_hq_plus_hsub ) # Hack to mask q
-    # q * h at u- and v-points
-    qhv = _nb_q2u( q * _nb_v2q( hv ) )
-    qhu = _nb_q2v( q * _nb_u2q( hu ) )
-    # For the stress tensor
-    D_tension = ux - vy
-    D_shear = uy + vx
-    # Use latest h here, but not in q (still using pre-continuity hq above)
-    # h at q points
-    hq = _nb_minh2v( _nb_minh2u( h ) )
-    # Components of stress tensor
-    nu_h_Dt = nu * h * D_tension
-    nu_hq_Ds = nu * hq * D_shear
-    # h at u- and v-points
-    rhu = 1.0 / ( _nb_h2u( h ) + hsub )
-    rhv = 1.0 / ( _nb_h2v( h ) + hsub )
-    # Divergence of stress tensor
-    uxxyy = _nb_dih( nu_h_Dt ) * rdx + _nb_djv( nu_hq_Ds ) * rdy
-    uxxyy = uxxyy * rhu
-    vxxyy = _nb_diu( nu_hq_Ds ) * rdx - _nb_djh( nu_h_Dt ) * rdy
-    vxxyy = vxxyy * rhv
-
-    # Wind forcing on top layer (explicit).
-    udot =   ( qhv - Bx ) + uxxyy
-    vdot = - ( qhu + By ) + vxxyy
-    udot[0,:,:] += taux * rhu[0,:,:]
-    vdot[0,:,:] += tauy * rhv[0,:,:]
-
-    # Interfacial-stress coefficients at u- and v-points (a_{k-1/2} = a_top, a_{k+1/2} = a_bot).
-    # Top:    a_top[0]    = 0 (wind is the explicit forcing applied above).
-    # Bottom: a_bot[nk-1] = epsilon (bottom drag).
-    # Interior: a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) appears as a_top[k] AND a_bot[k-1].
-    h_at_u = _nb_h2u( h )
-    h_at_v = _nb_h2v( h )
-    a_top_u = np.zeros((nk, nj, ni))
-    a_bot_u = np.zeros((nk, nj, ni))
-    a_top_v = np.zeros((nk, nj, ni))
-    a_bot_v = np.zeros((nk, nj, ni))
-    for k in range(1, nk):
-        a_int_u = 2.0 * nu_v / ( h_at_u[k-1] + h_at_u[k] + hsub )
-        a_top_u[k]   = a_int_u
-        a_bot_u[k-1] = a_int_u
-        a_int_v = 2.0 * nu_v / ( h_at_v[k-1] + h_at_v[k] + hsub )
-        a_top_v[k]   = a_int_v
-        a_bot_v[k-1] = a_int_v
-    a_bot_u[nk-1] = epsilon
-    a_bot_v[nk-1] = epsilon
-
-    # Explicit -(L u^n), -(L v^n): (L u)_k = ((a_top+a_bot) u_k - a_top u_{k-1} - a_bot u_{k+1}) / h_k.
-    # Vectorized over (j,i); k-loop only.
-    for k in range(nk):
-        Lu_k = (a_top_u[k] + a_bot_u[k]) * u[k]
-        Lv_k = (a_top_v[k] + a_bot_v[k]) * v[k]
-        if k > 0:
-            Lu_k -= a_top_u[k] * u[k-1]
-            Lv_k -= a_top_v[k] * v[k-1]
-        if k < nk - 1:
-            Lu_k -= a_bot_u[k] * u[k+1]
-            Lv_k -= a_bot_v[k] * v[k+1]
-        udot[k] -= Lu_k * rhu[k]
-        vdot[k] -= Lv_k * rhv[k]
-
-    # Implicit step: TDMAH2 (cancellation-free symmetric Thomas, Hallberg).
-    # Row-scale the system by h_k to symmetrize: the matrix becomes diag
-    # h_k(1+ic) + a^*_{k-1/2} + a^*_{k+1/2} with off-diagonals -a^*_{k±1/2},
-    # where a^*_{k±1/2} = alpha_nu*dt*a_{k±1/2} (real, ≥0) and ic = alpha_f*dt*f.
-    # RHS is h_k * dt*(udot + i vdot_at_u). Forward sweep keeps running q_k and
-    # Q_k built from sums of nonneg-real plus complex-with-positive-real-part —
-    # no catastrophic cancellation; bounded as h_k -> 0.
-    vdot_at_u = _nb_q2u( _nb_v2q( vdot ) )
-    udot_at_v = _nb_q2v( _nb_u2q( udot ) )
-
-    q       = np.empty((nk, nj, ni), dtype=np.complex128)
-    y_prime = np.empty((nk, nj, ni), dtype=np.complex128)
-
-    # u-point pass: take Re(Δw) for Δu.
-    ic_u = alpha_f * dt * f_at_u   # 2D real (nj, ni)
-    hc   = h_at_u[0] * ( 1.0 + 1j * ic_u )
-    a_t  = ( alpha_nu * dt ) * a_top_u[0]   # = 0 at the surface
-    a_b  = ( alpha_nu * dt ) * a_bot_u[0]
-    beta = 1.0 / ( hc + a_t + a_b )
-    q[0] = a_b * beta
-    Q    = hc * beta
-    y_prime[0] = h_at_u[0] * ( dt * udot[0] + 1j * ( dt * vdot_at_u[0] ) ) * beta
-    for k in range(1, nk):
-        a_t  = ( alpha_nu * dt ) * a_top_u[k]
-        a_b  = ( alpha_nu * dt ) * a_bot_u[k]
-        hc   = h_at_u[k] * ( 1.0 + 1j * ic_u )
-        beta = 1.0 / ( hc + a_t * Q + a_b )
-        q[k] = a_b * beta
-        Q    = ( hc + a_t * Q ) * beta
-        y_k  = h_at_u[k] * ( dt * udot[k] + 1j * ( dt * vdot_at_u[k] ) )
-        y_prime[k] = ( y_k + a_t * y_prime[k-1] ) * beta
-    delta_w = y_prime[nk-1]
-    u[nk-1] += delta_w.real
-    for k in range(nk-2, -1, -1):
-        delta_w = y_prime[k] + q[k] * delta_w
-        u[k] += delta_w.real
-
-    # v-point pass: take Im(Δw) for Δv.
-    ic_v = alpha_f * dt * f_at_v
-    hc   = h_at_v[0] * ( 1.0 + 1j * ic_v )
-    a_t  = ( alpha_nu * dt ) * a_top_v[0]
-    a_b  = ( alpha_nu * dt ) * a_bot_v[0]
-    beta = 1.0 / ( hc + a_t + a_b )
-    q[0] = a_b * beta
-    Q    = hc * beta
-    y_prime[0] = h_at_v[0] * ( dt * udot_at_v[0] + 1j * ( dt * vdot[0] ) ) * beta
-    for k in range(1, nk):
-        a_t  = ( alpha_nu * dt ) * a_top_v[k]
-        a_b  = ( alpha_nu * dt ) * a_bot_v[k]
-        hc   = h_at_v[k] * ( 1.0 + 1j * ic_v )
-        beta = 1.0 / ( hc + a_t * Q + a_b )
-        q[k] = a_b * beta
-        Q    = ( hc + a_t * Q ) * beta
-        y_k  = h_at_v[k] * ( dt * udot_at_v[k] + 1j * ( dt * vdot[k] ) )
-        y_prime[k] = ( y_k + a_t * y_prime[k-1] ) * beta
-    delta_w = y_prime[nk-1]
-    v[nk-1] += delta_w.imag
-    for k in range(nk-2, -1, -1):
-        delta_w = y_prime[k] + q[k] * delta_w
-        v[k] += delta_w.imag
-
-
-def _step_fused_impl(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
-                     dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
-                     h_target, u_target, v_target,
-                     h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
-    """Fused implementation of the time step (EXPERIMENTAL). Shared body for
-    the serial (_step_numba_fused) and threaded (_step_numba_fused_par)
-    kernels: njit-compiled with parallel=False the prange loops run serially,
-    with parallel=True they run across threads (parallelized over j-rows,
-    which are independent so the loops are race-free).
-
-    Same algorithm as _step_numba, but the helper-based array operations are
-    replaced by fused loops that recompute stencil quantities inline,
-    eliminating their temporary allocations: pre-continuity hq, continuity,
-    kinetic energy + Bernoulli + h-at-u/v reciprocals, the explicit momentum
-    accelerations (PV Coriolis fluxes, Bernoulli gradient, viscous stress
-    divergence), the TDMAH2 input averaging, and the solver tail (interfacial
+    """JIT-compiled, multi-threaded time step. Modifies u, v, h in place;
+    state arrays have shape (nk, nj, ni). The work is organized as fused loops
+    that recompute stencil quantities inline rather than building full-grid
+    temporaries: restoring, pre-continuity hq, continuity, kinetic energy +
+    Bernoulli + h-at-u/v reciprocals, the explicit momentum accelerations (PV
+    Coriolis fluxes, Bernoulli gradient, viscous stress divergence), the
+    cross-component averaging, and the solver tail (interfacial-stress
     coefficients computed inline as scalars; the cancellation-free TDMAH2
-    recurrence run per column with scalar locals). Per-cell expressions keep
-    the reference's arithmetic grouping, so results agree to roundoff."""
+    implicit solve run per column with scalar locals).
+
+    The j-row loops use prange and run across numba threads; rows are
+    independent, so the loops are race-free. This is a memory-bandwidth-bound
+    stencil, so set the thread count to the physical core count (not the SMT
+    thread count) with numba.set_num_threads(). Layer thickness h is the
+    prognostic; eta = h - D is diagnosed for the pressure gradient. The TDMAH2
+    recurrence row-scales each column by h_k to symmetrize the tridiagonal +
+    Coriolis system and bundle Coriolis as h_k(1+ic); every denominator is a
+    sum of nonnegative-real plus positive-real-part-complex terms, so it stays
+    robust as h_k -> 0. Re(delta_w) gives delta_u; Im(delta_w) gives delta_v."""
     nk, nj, ni = u.shape
     rdx = 1 / dx
     rdy = 1 / dy
@@ -626,22 +364,12 @@ def _step_fused_impl(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 v[k,j,i] += delta_w.imag
 
 
-# Two compilations of the shared fused body. Serial: prange acts as range.
-# Parallel: prange loops over j-rows run across numba threads (set the count
-# with numba.set_num_threads(); this is a memory-bandwidth-bound stencil, so
-# the sweet spot is the physical core count, not the SMT thread count).
-# parallel=True is left uncached because two Dispatchers compiled from one
-# py_func would otherwise share a cache key.
-_step_numba_fused     = njit(cache=True)(_step_fused_impl)
-_step_numba_fused_par = njit(parallel=True)(_step_fused_impl)
-
-
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
     def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
                  h_relax=0, u_relax=None, v_relax=None, u_target=None, v_target=None,
-                 hsub=1e-12, fused=False):
+                 hsub=1e-12):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -667,13 +395,6 @@ class SSWEM:
         v_target - Target meridional velocity field [m s-1] relaxed to when v_relax>0.
                   Scalar or any array broadcastable to (nk, nj, ni). Defaults to 0.
         hsub    - H sub-roundoff [m]
-        fused   - EXPERIMENTAL time-step kernel selector (default False).
-                  False      -> reference vectorized kernel (_step_numba).
-                  True       -> serial fused single-loop kernel.
-                  'parallel' -> threaded fused kernel (prange over j-rows).
-                  The fused kernels agree with the reference to roundoff; the
-                  parallel one scales best at the physical core count (set via
-                  numba.set_num_threads()).
         """
         self.ni = ni
         self.g = np.atleast_1d(np.asarray(g, dtype=float)).copy()
@@ -682,12 +403,6 @@ class SSWEM:
         if self.Ho.size != self.nk:
             raise ValueError(f"Ho must have length nk={self.nk}, got {self.Ho.size}")
         self.h_relax = float(h_relax)
-        # EXPERIMENTAL kernel selection: False -> reference _step_numba;
-        # True -> serial fused; 'parallel' -> threaded fused (prange over
-        # j-rows; set thread count with numba.set_num_threads()).
-        if fused not in (False, True, 'parallel'):
-            raise ValueError("fused must be False, True, or 'parallel'")
-        self.fused = fused
         self.Lx = Lx
         self.fo = fo
         self.beta = beta
@@ -933,6 +648,10 @@ class SSWEM:
         samp   - Steps between samples [steps]
         nsamps - Number of sample to integrate model [steps*samp]
         """
+        # Memory-bandwidth-bound stepper: peak throughput is at the physical
+        # core count, set via numba.set_num_threads() (the default may include
+        # SMT threads, which can run slower than physical-core-only).
+        print("numba threads =", get_num_threads())
         print("CFL: dt*epsilon/h_bot =", dt * self.epsilon / self.Ho[-1] )
         print("CFL: dt*nu_v/h_min^2 =", dt * self.nu_v / ( self.Ho.min()**2 ) )
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
@@ -986,19 +705,13 @@ class SSWEM:
         # Velocity-restoring gates are cached by the u_relax/v_relax setters
         # (a bool keeps the JIT argument types stable and lets numba skip the
         # term when restoring is off), so no per-step recomputation is needed.
-        if self.fused == 'parallel':
-            kernel = _step_numba_fused_par
-        elif self.fused:
-            kernel = _step_numba_fused
-        else:
-            kernel = _step_numba
-        kernel(self.u, self.v, self.h, self.D, self.taux, self.tauy,
-               self.f, self.f_at_u, self.f_at_v,
-               dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
-               self.alpha_f, self.alpha_nu,
-               self.h_target, self.u_target, self.v_target,
-               self.h_relax, self._u_relax, self._v_relax,
-               self._u_relax_on, self._v_relax_on, self.hsub, self.iter)
+        _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
+                    self.f, self.f_at_u, self.f_at_v,
+                    dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
+                    self.alpha_f, self.alpha_nu,
+                    self.h_target, self.u_target, self.v_target,
+                    self.h_relax, self._u_relax, self._v_relax,
+                    self._u_relax_on, self._v_relax_on, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
 
