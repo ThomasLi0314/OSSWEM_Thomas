@@ -122,8 +122,10 @@ def _nb_vxuy(u, v, rdx, rdy):
 # --- Numba-JIT step function ---
 
 @njit(cache=True)
-def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
-                dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu, h_relax, hsub, iter_num):
+def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
+                dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
+                h_target, u_target, v_target,
+                h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
     """JIT-compiled step function. Modifies u, v, h in-place. Layer thickness h
     is the prognostic; eta = h - D is diagnosed where needed (pressure gradient).
     State arrays u, v, h have shape (nk, nj, ni). g is a length-nk vector.
@@ -152,6 +154,18 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
     if h_relax > 0:
         h_dev = h[0].sum(axis=-1) / ni - h_target[0, :]
         h[0] -= ( dt * h_relax ) * h_dev.reshape(nj, 1)
+
+    # Restoring of velocities toward prescribed target patterns (full field,
+    # all layers). Explicit (operator-split) Euler step applied before the
+    # dynamics so the rest of the step sees the relaxed u, v. Stable while
+    # dt*u_relax <= 1. u_relax, v_relax, u_target, v_target all have the same
+    # shape as u, v; the u_relax_on / v_relax_on booleans (precomputed on the
+    # Python side) gate the term so it is skipped entirely when restoring is
+    # off, and avoid an ambiguous truth test on the array rate.
+    if u_relax_on:
+        u -= ( dt * u_relax ) * ( u - u_target )
+    if v_relax_on:
+        v -= ( dt * v_relax ) * ( v - v_target )
 
     # Cache upwind-signed velocities (u,v are unchanged until end of step)
     u_pos = np.maximum( u, 0.0 )
@@ -334,7 +348,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v, h_target,
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
-    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0, h_relax=0, hsub=1e-12):
+    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
+                 h_relax=0, u_relax=None, v_relax=None, u_target=None, v_target=None, hsub=1e-12):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -349,6 +364,16 @@ class SSWEM:
         nu_v    - Vertical viscosity [m2 s-1]; sets interior interfacial-stress
                   coefficients a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) for 1<k<=K. Defaults to 0.
         h_relax - Restoring rate for zonal-mean surface eta [s-1] (scalar).
+        u_relax - Restoring rate for u toward u_target [s-1]. None (default) for
+                  no restoring; otherwise a scalar or any array broadcastable to
+                  (nk, nj, ni) for a spatially varying rate.
+        v_relax - Restoring rate for v toward v_target [s-1]. None (default) for
+                  no restoring; otherwise a scalar or any array broadcastable to
+                  (nk, nj, ni) for a spatially varying rate.
+        u_target - Target zonal velocity field [m s-1] relaxed to when u_relax>0.
+                  Scalar or any array broadcastable to (nk, nj, ni). Defaults to 0.
+        v_target - Target meridional velocity field [m s-1] relaxed to when v_relax>0.
+                  Scalar or any array broadcastable to (nk, nj, ni). Defaults to 0.
         hsub    - H sub-roundoff [m]
         """
         self.ni = ni
@@ -398,6 +423,21 @@ class SSWEM:
         self.zero_forcing()
         # Default h_target = rest layer thickness per row (no perturbation)
         self.h_target = np.tile(self.Ho[:, None], (1, self.nj)).astype(float)
+
+        # Velocity restoring targets and rates (full field, all layers). Accept
+        # anything broadcastable to (nk, nj, ni): scalar, (ni,), (nj,ni),
+        # (nk,nj,ni), ... Rates default to None (no restoring) -> a zero array,
+        # so the type passed to the JIT step is always a float64 (nk,nj,ni)
+        # array; the actual on/off decision is made by a boolean gate in step().
+        shape = (self.nk, self.nj, self.ni)
+        u_t = 0.0 if u_target is None else u_target
+        v_t = 0.0 if v_target is None else v_target
+        self.u_target = np.broadcast_to(np.asarray(u_t, dtype=float), shape).copy()
+        self.v_target = np.broadcast_to(np.asarray(v_t, dtype=float), shape).copy()
+        u_r = 0.0 if u_relax is None else u_relax
+        v_r = 0.0 if v_relax is None else v_relax
+        self.u_relax = np.broadcast_to(np.asarray(u_r, dtype=float), shape).copy()
+        self.v_relax = np.broadcast_to(np.asarray(v_r, dtype=float), shape).copy()
 
         # Derived parameters
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
@@ -537,6 +577,21 @@ class SSWEM:
                     SSWEM._cubint( self.yh1 / self.Ly, 0.5, 0.6 ) )
         self.h_target[k, :] = self.Ho[k] + mag * profile
 
+    def set_u_target_jet(self, mag):
+        """Sets the u restoring target to a meridional jet profile. mag is the
+        per-layer jet amplitude [m s-1]: a scalar (same amplitude in every
+        layer) or a length-nk vector (one amplitude per layer)."""
+        mag = np.atleast_1d(np.asarray(mag, dtype=float))
+        if mag.size == 1:
+            mag = np.full(self.nk, mag[0])
+        elif mag.size != self.nk:
+            raise ValueError(f"mag must be a scalar or length nk={self.nk}, got {mag.size}")
+        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.25, 0.5 ) -
+                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.75 ) )
+        self.u_target = np.empty_like(self.u)
+        for k in range(0,self.nk):
+            self.u_target[k, :] = mag[k] * profile
+
     def run(self, dt, samp, nsamps):
         """
         dt     - Time step [s]
@@ -552,6 +607,10 @@ class SSWEM:
         print("CFL: dt*nu/dx^2 =", dt * self.nu / self.dx**2 )
         if self.h_relax > 0:
             print("CFL: dt*h_relax =", dt * self.h_relax )
+        if self.u_relax.max() > 0:
+            print("CFL: dt*u_relax =", dt * self.u_relax.max() )
+        if self.v_relax.max() > 0:
+            print("CFL: dt*v_relax =", dt * self.v_relax.max() )
         nsteps = nsamps * samp
         print("nsteps =", nsteps)
         Trun = nsteps * dt
@@ -589,10 +648,18 @@ class SSWEM:
         """
         dt   - Time step [s]
         """
+        # Gate the velocity restoring on the Python side: a bool keeps the JIT
+        # argument types stable and lets numba skip the term when restoring is
+        # off (all rates zero / left at the None default).
+        u_relax_on = bool( self.u_relax.max() > 0 )
+        v_relax_on = bool( self.v_relax.max() > 0 )
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
-                    self.f, self.f_at_u, self.f_at_v, self.h_target,
+                    self.f, self.f_at_u, self.f_at_v,
                     dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
-                    self.alpha_f, self.alpha_nu, self.h_relax, self.hsub, self.iter)
+                    self.alpha_f, self.alpha_nu,
+                    self.h_target, self.u_target, self.v_target,
+                    self.h_relax, self.u_relax, self.v_relax,
+                    u_relax_on, v_relax_on, self.hsub, self.iter)
         self.time += dt
         self.iter += 1
 
