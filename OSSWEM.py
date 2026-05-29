@@ -394,7 +394,7 @@ class SSWEM:
     def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
                  h_zonal_relax=0, h_relax=None, u_relax=None, v_relax=None,
                  h_target=None, u_target=None, v_target=None,
-                 hsub=1e-12):
+                 hsub=1e-12, Ly=None):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -421,6 +421,10 @@ class SSWEM:
                   sponge. Scalar or any array broadcastable to (nk, nj, ni).
                   Default 0 (h_target defaults to the rest thickness Ho).
         hsub    - H sub-roundoff [m]
+        Ly      - Domain height [m]. Default None -> square domain (Ly=Lx,
+                  nj=ni). If given, cells stay square (dy=dx=Lx/ni) and nj is
+                  derived from Ly (snapped to an integer number of cells),
+                  giving a rectangular domain (e.g. longer in x than y).
         """
         self.ni = ni
         self.g = np.atleast_1d(np.asarray(g, dtype=float)).copy()
@@ -442,10 +446,17 @@ class SSWEM:
         # Grid resolution
         self.dx = Lx / ni # Cell width [m]
 
-        # Limit to square domains/grids for now
-        self.nj = self.ni
-        self.Ly = self.Lx
-        self.dy = self.dx
+        # Domain in y. Default (Ly=None) is a square domain/grid. If Ly is given,
+        # the cells are kept square (dy = dx) and nj is derived from Ly (Ly is
+        # snapped to an integer number of cells), allowing a rectangular domain.
+        if Ly is None:
+            self.nj = self.ni
+            self.Ly = self.Lx
+            self.dy = self.dx
+        else:
+            self.dy = self.dx
+            self.nj = int(round(Ly / self.dx))
+            self.Ly = self.nj * self.dy
 
         # Grid
         # xh1, yh1 are 1D coordinate for h points
@@ -671,14 +682,15 @@ class SSWEM:
     def set_u_target_jet(self, mag):
         """Sets the u restoring target to a meridional jet profile. mag is the
         per-layer jet amplitude [m s-1]: a scalar (same amplitude in every
-        layer) or a length-nk vector (one amplitude per layer)."""
+        layer) or a length-nk vector (one amplitude per layer). The jet spans
+        y/Ly in [0.4, 0.6] (peak at 0.5)."""
         mag = np.atleast_1d(np.asarray(mag, dtype=float))
         if mag.size == 1:
             mag = np.full(self.nk, mag[0])
         elif mag.size != self.nk:
             raise ValueError(f"mag must be a scalar or length nk={self.nk}, got {mag.size}")
-        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.25, 0.5 ) -
-                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.75 ) )
+        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.4, 0.5 ) -
+                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.6 ) )
         self.u_target = np.empty_like(self.u)
         for k in range(0,self.nk):
             self.u_target[k, :] = mag[k] * profile
