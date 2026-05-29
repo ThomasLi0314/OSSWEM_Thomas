@@ -80,7 +80,7 @@ def _nb_vxuy(u, v, rdx, rdy):
 
 @njit(parallel=True, cache=True)
 def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
-                dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
+                dt, dx, dy, g, epsilon, nu_h, nu_v, alpha_f, alpha_nu,
                 h_zonal_target, h_target, u_target, v_target,
                 h_zonal_relax, h_relax, u_relax, v_relax,
                 h_relax_on, u_relax_on, v_relax_on, hsub, iter_num):
@@ -260,24 +260,24 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 qhu = 0.5 * ( qpv_c  * 0.5 * ( hu[k,j,i]  + hu[k,jm,i]  )
                             + qpv_ip * 0.5 * ( hu[k,j,ip] + hu[k,jm,ip] ) )
 
-                # Stress tensor: nu*h*D_tension at h-points {(j,i),(j,im),(jm,i)};
-                # nu*hq*D_shear at q-points {(j,i),(jp,i),(j,ip)}.
+                # Stress tensor: nu_h*h*D_tension at h-points {(j,i),(j,im),(jm,i)};
+                # nu_h*hq*D_shear at q-points {(j,i),(jp,i),(j,ip)}.
                 Dt_c  = ( u[k,j,ip] - u[k,j,i]  ) * rdx - ( v[k,jp,i] - v[k,j,i]  ) * rdy
-                nuhDt_c  = nu * h[k,j,i]  * Dt_c
+                nuhDt_c  = nu_h * h[k,j,i]  * Dt_c
                 Dt_im = ( u[k,j,i]  - u[k,j,im] ) * rdx - ( v[k,jp,im]- v[k,j,im] ) * rdy
-                nuhDt_im = nu * h[k,j,im] * Dt_im
+                nuhDt_im = nu_h * h[k,j,im] * Dt_im
                 Dt_jm = ( u[k,jm,ip]- u[k,jm,i] ) * rdx - ( v[k,j,i]  - v[k,jm,i] ) * rdy
-                nuhDt_jm = nu * h[k,jm,i] * Dt_jm
+                nuhDt_jm = nu_h * h[k,jm,i] * Dt_jm
 
                 Ds_c  = ( u[k,j,i]  - u[k,jm,i] ) * rdy + ( v[k,j,i]  - v[k,j,im]  ) * rdx
                 hqp_c  = min( min( h[k,j,i],  h[k,j,im]  ), min( h[k,jm,i], h[k,jm,im] ) )
-                nuhqDs_c  = nu * hqp_c  * Ds_c
+                nuhqDs_c  = nu_h * hqp_c  * Ds_c
                 Ds_jp = ( u[k,jp,i] - u[k,j,i]  ) * rdy + ( v[k,jp,i] - v[k,jp,im] ) * rdx
                 hqp_jp = min( min( h[k,jp,i], h[k,jp,im] ), min( h[k,j,i],  h[k,j,im]  ) )
-                nuhqDs_jp = nu * hqp_jp * Ds_jp
+                nuhqDs_jp = nu_h * hqp_jp * Ds_jp
                 Ds_ip = ( u[k,j,ip] - u[k,jm,ip]) * rdy + ( v[k,j,ip] - v[k,j,i]   ) * rdx
                 hqp_ip = min( min( h[k,j,ip], h[k,j,i]   ), min( h[k,jm,ip],h[k,jm,i]  ) )
-                nuhqDs_ip = nu * hqp_ip * Ds_ip
+                nuhqDs_ip = nu_h * hqp_ip * Ds_ip
 
                 uxxyy = ( ( nuhDt_c - nuhDt_im ) * rdx + ( nuhqDs_jp - nuhqDs_c ) * rdy ) * rhu[k,j,i]
                 vxxyy = ( ( nuhqDs_ip - nuhqDs_c ) * rdx - ( nuhDt_c - nuhDt_jm ) * rdy ) * rhv[k,j,i]
@@ -391,7 +391,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
-    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
+    def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu_h, nu_v=0,
                  h_zonal_relax=0, h_relax=None, u_relax=None, v_relax=None,
                  h_target=None, u_target=None, v_target=None,
                  hsub=1e-12, nj=None, Ly=None):
@@ -405,7 +405,7 @@ class SSWEM:
         fo      - Coriolis [s-1]
         beta    - df/dy [m-1 s-1]
         epsilon - Bottom drag rate [m s-1]; bottom-boundary entry of L.
-        nu      - Lateral (horizontal) viscosity [m2 s-1]
+        nu_h    - Lateral (horizontal) viscosity [m2 s-1]
         nu_v    - Vertical viscosity [m2 s-1]; sets interior interfacial-stress
                   coefficients a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) for 1<k<=K. Defaults to 0.
         h_zonal_relax - Restoring rate for zonal-mean layer-0 thickness toward
@@ -438,7 +438,7 @@ class SSWEM:
         self.fo = fo
         self.beta = beta
         self.epsilon = epsilon
-        self.nu = nu
+        self.nu_h = nu_h
         self.nu_v = float(nu_v)
         self.hsub = hsub
         self.alpha_f = 0.5 # Crank-Nicholson for Coriolis
@@ -716,13 +716,13 @@ class SSWEM:
         # core count, set via numba.set_num_threads() (the default may include
         # SMT threads, which can run slower than physical-core-only).
         print("numba threads =", get_num_threads())
-        print("CFL: dt*epsilon/h_bot =", dt * self.epsilon / self.Ho[-1] )
-        print("CFL: dt*nu_v/h_min^2 =", dt * self.nu_v / ( self.Ho.min()**2 ) )
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
         print("CFL: dt*cg/dx =", dt * self.cg / self.dx )
+        print("CFL: dt*epsilon/h_bot =", dt * self.epsilon / self.Ho[-1] )
+        print("CFL: dt*nu_v/h_min^2 =", dt * self.nu_v / ( self.Ho.min()**2 ) )
         if self.cg1 is not None:
             print("CFL: dt*cg1/dx =", dt * self.cg1 / self.dx )
-        print("CFL: dt*nu/dx^2 =", dt * self.nu / self.dx**2 )
+        print("CFL: dt*nu_h/dx^2 =", dt * self.nu_h / self.dx**2 )
         if self.h_zonal_relax > 0:
             print("CFL: dt*h_zonal_relax =", dt * self.h_zonal_relax )
         if self.h_relax.max() > 0:
@@ -754,6 +754,10 @@ class SSWEM:
             self.step( dt )
             if np.any( np.isnan( self.u ) ):
                 print('Model has blown up!!! Stopping early')
+                u = u[:nsamp]
+                v = v[:nsamp]
+                h = h[:nsamp]
+                time = time[:nsamp]
                 break
             if iter % samp == 0:
                 nsamp += 1
@@ -773,7 +777,7 @@ class SSWEM:
         # is off), so no per-step recomputation is needed.
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v,
-                    dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
+                    dt, self.dx, self.dy, self.g, self.epsilon, self.nu_h, self.nu_v,
                     self.alpha_f, self.alpha_nu,
                     self.h_zonal_target, self.h_target, self.u_target, self.v_target,
                     self.h_zonal_relax, self._h_relax, self._u_relax, self._v_relax,
@@ -819,3 +823,16 @@ class SSWEM:
         if k is None:
             return q
         return q[k]
+
+    def KE(self, h=None, u=None, v=None, k=None):
+        """Per-layer kinetic energy , KE = h /2 ( u^2 + v^2 )  [m3 s-2].
+        Returns (nk, nj, ni) by default; pass an integer k to return a 2D slice."""
+        if u is None: u = self.u
+        if v is None: v = self.v
+        if h is None: h = self.h
+        u2 = _nb_q2v( u**2 )
+        v2 = _nb_q2u( v**2 )
+        KE = 0.5 * h * ( u2 + v2 )
+        if k is None:
+            return KE
+        return KE[k]
