@@ -84,9 +84,9 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 h_zonal_target, h_target, u_target, v_target,
                 h_zonal_relax, h_relax, u_relax, v_relax,
                 h_relax_on, u_relax_on, v_relax_on, hsub, iter_num):
-    """JIT-compiled, multi-threaded time step. Modifies u, v, h in place;
-    state arrays have shape (nk, nj, ni). The work is organized as fused loops
-    that recompute stencil quantities inline rather than building full-grid
+    """JIT-compiled, multi-threaded time step. Modifies u, v, h in place; state
+    arrays have shape (nk, nj, ni). The work is organized as fused loops that
+    recompute stencil quantities inline rather than building full-grid
     temporaries: restoring, pre-continuity hq, continuity, kinetic energy +
     Bernoulli + h-at-u/v reciprocals, the explicit momentum accelerations (PV
     Coriolis fluxes, Bernoulli gradient, viscous stress divergence), the
@@ -97,21 +97,39 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     The j-row loops use prange and run across numba threads; rows are
     independent, so the loops are race-free. This is a memory-bandwidth-bound
     stencil, so set the thread count to the physical core count (not the SMT
-    thread count) with numba.set_num_threads(). Layer thickness h is the
-    prognostic; eta = h - D is diagnosed for the pressure gradient. The TDMAH2
-    recurrence row-scales each column by h_k to symmetrize the tridiagonal +
-    Coriolis system and bundle Coriolis as h_k(1+ic); every denominator is a
-    sum of nonnegative-real plus positive-real-part-complex terms, so it stays
-    robust as h_k -> 0. Re(delta_w) gives delta_u; Im(delta_w) gives delta_v."""
+    thread count) with numba.set_num_threads().
+
+    IMPORTANT for parallel=True correctness: every reduction/broadcast is
+    written as an explicit loop, NOT a numpy array expression. In particular the
+    zonal-mean h restoring is an explicit per-row loop rather than
+    h[0].sum(axis=-1)/reshape/broadcast, because numba's ParallelAccelerator
+    mis-compiles axis reductions + broadcasts (it produced garbage / blow-ups,
+    e.g. in the 1-layer smoke test, while every per-term test stayed
+    bit-identical). Keep new terms in explicit-loop form.
+
+    Layer thickness h is the prognostic; eta = h - D is diagnosed for the
+    pressure gradient. The TDMAH2 recurrence row-scales each column by h_k to
+    symmetrize the tridiagonal + Coriolis system and bundle Coriolis as
+    h_k(1+ic); every denominator is a sum of nonnegative-real plus
+    positive-real-part-complex terms, so it stays robust as h_k -> 0.
+    Re(delta_w) gives delta_u; Im(delta_w) gives delta_v."""
     nk, nj, ni = u.shape
     rdx = 1 / dx
     rdy = 1 / dy
 
     # --- restoring ---
     # Zonal-mean h restoring on layer 0 toward h_zonal_target[0,:] (scalar rate).
+    # Explicit per-row loop (NOT h[0].sum(axis=-1)/reshape/broadcast): numba
+    # parallel=True mis-compiles that axis reduction + broadcast.
     if h_zonal_relax > 0:
-        h_dev = h[0].sum(axis=-1) / ni - h_zonal_target[0, :]
-        h[0] -= ( dt * h_zonal_relax ) * h_dev.reshape(nj, 1)
+        cz = dt * h_zonal_relax
+        for j in prange(nj):
+            s = 0.0
+            for i in range(ni):
+                s += h[0, j, i]
+            cd = cz * ( s / ni - h_zonal_target[0, j] )
+            for i in range(ni):
+                h[0, j, i] -= cd
     # Pointwise (localizable) sponge restoring of h, u, v toward their full-field
     # targets; rates are (nk,nj,ni) arrays, gated by precomputed booleans.
     if h_relax_on:
