@@ -81,8 +81,9 @@ def _nb_vxuy(u, v, rdx, rdy):
 @njit(parallel=True, cache=True)
 def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 dt, dx, dy, g, epsilon, nu, nu_v, alpha_f, alpha_nu,
-                h_target, u_target, v_target,
-                h_relax, u_relax, v_relax, u_relax_on, v_relax_on, hsub, iter_num):
+                h_zonal_target, h_target, u_target, v_target,
+                h_zonal_relax, h_relax, u_relax, v_relax,
+                h_relax_on, u_relax_on, v_relax_on, hsub, iter_num):
     """JIT-compiled, multi-threaded time step. Modifies u, v, h in place;
     state arrays have shape (nk, nj, ni). The work is organized as fused loops
     that recompute stencil quantities inline rather than building full-grid
@@ -106,10 +107,15 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     rdx = 1 / dx
     rdy = 1 / dy
 
-    # --- restoring (identical to reference) ---
-    if h_relax > 0:
-        h_dev = h[0].sum(axis=-1) / ni - h_target[0, :]
-        h[0] -= ( dt * h_relax ) * h_dev.reshape(nj, 1)
+    # --- restoring ---
+    # Zonal-mean h restoring on layer 0 toward h_zonal_target[0,:] (scalar rate).
+    if h_zonal_relax > 0:
+        h_dev = h[0].sum(axis=-1) / ni - h_zonal_target[0, :]
+        h[0] -= ( dt * h_zonal_relax ) * h_dev.reshape(nj, 1)
+    # Pointwise (localizable) sponge restoring of h, u, v toward their full-field
+    # targets; rates are (nk,nj,ni) arrays, gated by precomputed booleans.
+    if h_relax_on:
+        h -= ( dt * h_relax ) * ( h - h_target )
     if u_relax_on:
         u -= ( dt * u_relax ) * ( u - u_target )
     if v_relax_on:
@@ -368,7 +374,8 @@ class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
     def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
-                 h_relax=0, u_relax=None, v_relax=None, u_target=None, v_target=None,
+                 h_zonal_relax=0, h_relax=None, u_relax=None, v_relax=None,
+                 h_target=None, u_target=None, v_target=None,
                  hsub=1e-12):
         """
         ni      - Number of cells in i-direction
@@ -383,17 +390,18 @@ class SSWEM:
         nu      - Lateral (horizontal) viscosity [m2 s-1]
         nu_v    - Vertical viscosity [m2 s-1]; sets interior interfacial-stress
                   coefficients a_{k-1/2} = 2*nu_v/(h_{k-1}+h_k) for 1<k<=K. Defaults to 0.
-        h_relax - Restoring rate for zonal-mean surface eta [s-1] (scalar).
-        u_relax - Restoring rate for u toward u_target [s-1]. None (default) for
-                  no restoring; otherwise a scalar or any array broadcastable to
-                  (nk, nj, ni) for a spatially varying rate.
-        v_relax - Restoring rate for v toward v_target [s-1]. None (default) for
-                  no restoring; otherwise a scalar or any array broadcastable to
-                  (nk, nj, ni) for a spatially varying rate.
-        u_target - Target zonal velocity field [m s-1] relaxed to when u_relax>0.
-                  Scalar or any array broadcastable to (nk, nj, ni). Defaults to 0.
-        v_target - Target meridional velocity field [m s-1] relaxed to when v_relax>0.
-                  Scalar or any array broadcastable to (nk, nj, ni). Defaults to 0.
+        h_zonal_relax - Restoring rate for zonal-mean layer-0 thickness toward
+                  h_zonal_target [s-1] (scalar). Acts on the zonal mean only, so
+                  it nudges the mean profile without damping eddies. Set the
+                  target with set_h_forcing().
+        h_relax, u_relax, v_relax - Pointwise (localizable) sponge restoring
+                  rates [s-1] for h, u, v toward h_target, u_target, v_target.
+                  None (default) for no restoring; otherwise a scalar or any
+                  array broadcastable to (nk, nj, ni) for a spatially varying
+                  rate (e.g. a sponge confined to part of the domain).
+        h_target, u_target, v_target - Full-field targets for the pointwise
+                  sponge. Scalar or any array broadcastable to (nk, nj, ni).
+                  Default 0 (h_target defaults to the rest thickness Ho).
         hsub    - H sub-roundoff [m]
         """
         self.ni = ni
@@ -402,7 +410,7 @@ class SSWEM:
         self.nk = self.g.size
         if self.Ho.size != self.nk:
             raise ValueError(f"Ho must have length nk={self.nk}, got {self.Ho.size}")
-        self.h_relax = float(h_relax)
+        self.h_zonal_relax = float(h_zonal_relax)
         self.Lx = Lx
         self.fo = fo
         self.beta = beta
@@ -441,22 +449,28 @@ class SSWEM:
         self.flat_topog()
         self.resting_state()
         self.zero_forcing()
-        # Default h_target = rest layer thickness per row (no perturbation)
-        self.h_target = np.tile(self.Ho[:, None], (1, self.nj)).astype(float)
+        # Zonal-mean restoring target: rest layer thickness per row (nk, nj).
+        # Used by the scalar h_zonal_relax mechanism (set via set_h_forcing).
+        self.h_zonal_target = np.tile(self.Ho[:, None], (1, self.nj)).astype(float)
 
-        # Velocity restoring targets and rates (full field, all layers). Accept
+        # Pointwise-sponge targets and rates (full field, all layers). Accept
         # anything broadcastable to (nk, nj, ni): scalar, (ni,), (nj,ni),
         # (nk,nj,ni), ... Rates default to None (no restoring) -> a zero array,
         # so the type passed to the JIT step is always a float64 (nk,nj,ni)
         # array; the actual on/off decision is made by a boolean gate in step().
+        # h_target defaults to the rest thickness Ho (sensible if a sponge is
+        # enabled without setting a target); u/v targets default to 0.
         shape = (self.nk, self.nj, self.ni)
+        h_t = self.Ho[:, None, None] if h_target is None else h_target
         u_t = 0.0 if u_target is None else u_target
         v_t = 0.0 if v_target is None else v_target
+        self.h_target = np.broadcast_to(np.asarray(h_t, dtype=float), shape).copy()
         self.u_target = np.broadcast_to(np.asarray(u_t, dtype=float), shape).copy()
         self.v_target = np.broadcast_to(np.asarray(v_t, dtype=float), shape).copy()
         # Rates are routed through their property setters (below), which coerce
         # to a (nk,nj,ni) float64 array and cache the on/off gate once, so the
         # per-step .max() recomputation is avoided.
+        self.h_relax = h_relax
         self.u_relax = u_relax
         self.v_relax = v_relax
 
@@ -507,6 +521,14 @@ class SSWEM:
                               (self.nk, self.nj, self.ni)).copy()
         arr.flags.writeable = False
         return arr, bool(arr.max() > 0)
+
+    @property
+    def h_relax(self):
+        return self._h_relax
+
+    @h_relax.setter
+    def h_relax(self, value):
+        self._h_relax, self._h_relax_on = self._set_relax(value)
 
     @property
     def u_relax(self):
@@ -616,16 +638,17 @@ class SSWEM:
         return ( 1 + 2 * ( 1 - z ) ) * z**2
         
     def set_h_forcing(self, mag, k=0):
-        """Sets the meridional restoring profile for layer k. The zonal-mean
-        h[k] is restored toward h_target[k, j] = Ho[k] + mag * profile(yh1[j]/Ly).
+        """Sets the meridional zonal-mean restoring profile for layer k. The
+        zonal-mean h[k] is restored toward
+        h_zonal_target[k, j] = Ho[k] + mag * profile(yh1[j]/Ly).
         Default k=0 (top layer); pass k explicitly to set a different layer.
-        Note: only layer 0's target is currently used (h_relax is scalar and
-        the restoring branch in _step_numba acts on layer 0 only)."""
+        Note: only layer 0's target is currently used (h_zonal_relax is scalar
+        and the zonal restoring branch in _step_numba acts on layer 0 only)."""
         if k < 0 or k >= self.nk:
             raise ValueError(f"k must be in [0,{self.nk-1}], got {k}")
         profile = ( SSWEM._cubint( self.yh1 / self.Ly, 0.0, 0.1 ) -
                     SSWEM._cubint( self.yh1 / self.Ly, 0.5, 0.6 ) )
-        self.h_target[k, :] = self.Ho[k] + mag * profile
+        self.h_zonal_target[k, :] = self.Ho[k] + mag * profile
 
     def set_u_target_jet(self, mag):
         """Sets the u restoring target to a meridional jet profile. mag is the
@@ -659,8 +682,10 @@ class SSWEM:
         if self.cg1 is not None:
             print("CFL: dt*cg1/dx =", dt * self.cg1 / self.dx )
         print("CFL: dt*nu/dx^2 =", dt * self.nu / self.dx**2 )
-        if self.h_relax > 0:
-            print("CFL: dt*h_relax =", dt * self.h_relax )
+        if self.h_zonal_relax > 0:
+            print("CFL: dt*h_zonal_relax =", dt * self.h_zonal_relax )
+        if self.h_relax.max() > 0:
+            print("CFL: dt*h_relax =", dt * self.h_relax.max() )
         if self.u_relax.max() > 0:
             print("CFL: dt*u_relax =", dt * self.u_relax.max() )
         if self.v_relax.max() > 0:
@@ -702,16 +727,17 @@ class SSWEM:
         """
         dt   - Time step [s]
         """
-        # Velocity-restoring gates are cached by the u_relax/v_relax setters
-        # (a bool keeps the JIT argument types stable and lets numba skip the
-        # term when restoring is off), so no per-step recomputation is needed.
+        # Sponge gates are cached by the h/u/v_relax setters (a bool keeps the
+        # JIT argument types stable and lets numba skip a term when its sponge
+        # is off), so no per-step recomputation is needed.
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v,
                     dt, self.dx, self.dy, self.g, self.epsilon, self.nu, self.nu_v,
                     self.alpha_f, self.alpha_nu,
-                    self.h_target, self.u_target, self.v_target,
-                    self.h_relax, self._u_relax, self._v_relax,
-                    self._u_relax_on, self._v_relax_on, self.hsub, self.iter)
+                    self.h_zonal_target, self.h_target, self.u_target, self.v_target,
+                    self.h_zonal_relax, self._h_relax, self._u_relax, self._v_relax,
+                    self._h_relax_on, self._u_relax_on, self._v_relax_on,
+                    self.hsub, self.iter)
         self.time += dt
         self.iter += 1
 
