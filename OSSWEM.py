@@ -394,7 +394,7 @@ class SSWEM:
     def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu, nu_v=0,
                  h_zonal_relax=0, h_relax=None, u_relax=None, v_relax=None,
                  h_target=None, u_target=None, v_target=None,
-                 hsub=1e-12, Ly=None):
+                 hsub=1e-12, nj=None, Ly=None):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -421,6 +421,7 @@ class SSWEM:
                   sponge. Scalar or any array broadcastable to (nk, nj, ni).
                   Default 0 (h_target defaults to the rest thickness Ho).
         hsub    - H sub-roundoff [m]
+        nj      - Number of cells in j-direction. Default None.
         Ly      - Domain height [m]. Default None -> square domain (Ly=Lx,
                   nj=ni). If given, cells stay square (dy=dx=Lx/ni) and nj is
                   derived from Ly (snapped to an integer number of cells),
@@ -449,14 +450,23 @@ class SSWEM:
         # Domain in y. Default (Ly=None) is a square domain/grid. If Ly is given,
         # the cells are kept square (dy = dx) and nj is derived from Ly (Ly is
         # snapped to an integer number of cells), allowing a rectangular domain.
-        if Ly is None:
-            self.nj = self.ni
-            self.Ly = self.Lx
-            self.dy = self.dx
+        if nj is None :
+            if Ly is None :
+                self.nj = self.ni
+                self.Ly = self.Lx
+                self.dy = self.dx
+            else:
+                self.dy = self.dx
+                self.nj = int(round(Ly / self.dx))
+                self.Ly = self.nj * self.dy
         else:
-            self.dy = self.dx
-            self.nj = int(round(Ly / self.dx))
-            self.Ly = self.nj * self.dy
+            self.nj = nj
+            if Ly is None : # Assume equal cell aspect ratio
+                self.dy = self.dx
+                self.Ly = self.dy * self.nj
+            else:
+                self.Ly = Ly
+                self.dy = self.Ly / self.nj # Cell height [m]
 
         # Grid
         # xh1, yh1 are 1D coordinate for h points
@@ -471,7 +481,8 @@ class SSWEM:
         self.xu, self.yu = np.meshgrid(self.xq1, self.yh1)
         # xv, yv are @D coordinate for u points
         self.xv, self.yv = np.meshgrid(self.xh1, self.yq1)
-        print("Grid: dx =",self.dx,"[m]")
+        print("mesh: ni =",self.ni," nj =",self.nj)
+        print("Grid: dx =",self.dx,"[m]"," dy =",self.dy,"[m]")
 
         # Resting initial conditions, no (flat) bathymetry and no forcing.
         # flat_topog must precede resting_state since rest h = D.
