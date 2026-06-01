@@ -117,28 +117,6 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     rdx = 1 / dx
     rdy = 1 / dy
 
-    # --- restoring ---
-    # Zonal-mean h restoring on layer 0 toward h_zonal_target[0,:] (scalar rate).
-    # Explicit per-row loop (NOT h[0].sum(axis=-1)/reshape/broadcast): numba
-    # parallel=True mis-compiles that axis reduction + broadcast.
-    if h_zonal_relax > 0:
-        cz = dt * h_zonal_relax
-        for j in prange(nj):
-            s = 0.0
-            for i in range(ni):
-                s += h[0, j, i]
-            cd = cz * ( s / ni - h_zonal_target[0, j] )
-            for i in range(ni):
-                h[0, j, i] -= cd
-    # Pointwise (localizable) sponge restoring of h, u, v toward their full-field
-    # targets; rates are (nk,nj,ni) arrays, gated by precomputed booleans.
-    if h_relax_on:
-        h -= ( dt * h_relax ) * ( h - h_target )
-    if u_relax_on:
-        u -= ( dt * u_relax ) * ( u - u_target )
-    if v_relax_on:
-        v -= ( dt * v_relax ) * ( v - v_target )
-
     # Pre-continuity hq at q-points (used for PV in the explicit loop); kept as
     # an array because PV is needed at several q-points. Fused u2q(h2u(h)).
     hq_pre = np.empty((nk, nj, ni))
@@ -387,6 +365,36 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 delta_w = y_prime[k,j,i] + q[k,j,i] * delta_w
                 v[k,j,i] += delta_w.imag
 
+    # --- restoring (backward Euler) ---
+    # Applied after the dynamics, so each field relaxes implicitly toward its
+    # target: q^{n+1} = (q + c*q_targ)/(1+c) with c = dt*rate. This is unconditionally
+    # stable for any rate (amplification 1/(1+c) in (0,1]) and clamps to the target
+    # as c->inf. Algebraically q^{n+1} = q - c/(1+c)*(q - q_targ), so it keeps the
+    # explicit "-=" form with the rate coefficient c replaced by c/(1+c).
+    # Zonal-mean h restoring on layer 0 toward h_zonal_target[0,:] (scalar rate).
+    # Explicit per-row loop (NOT h[0].sum(axis=-1)/reshape/broadcast): numba
+    # parallel=True mis-compiles that axis reduction + broadcast.
+    if h_zonal_relax > 0:
+        cz = dt * h_zonal_relax
+        czb = cz / ( 1.0 + cz )
+        for j in prange(nj):
+            s = 0.0
+            for i in range(ni):
+                s += h[0, j, i]
+            cd = czb * ( s / ni - h_zonal_target[0, j] )
+            for i in range(ni):
+                h[0, j, i] -= cd
+    # Pointwise (localizable) sponge restoring of h toward full-field
+    # target; rate is (nk,nj,ni) array, gated by precomputed booleans.
+    if h_relax_on:
+        h -= ( dt * h_relax / ( 1.0 + dt * h_relax ) ) * ( h - h_target )
+
+    # Pointwise (localizable) sponge restoring of u, v toward their full-field
+    # targets; rates are (nk,nj,ni) arrays, gated by precomputed booleans.
+    if u_relax_on:
+        u -= ( dt * u_relax / ( 1.0 + dt * u_relax ) ) * ( u - u_target )
+    if v_relax_on:
+        v -= ( dt * v_relax / ( 1.0 + dt * v_relax ) ) * ( v - v_target )
 
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
@@ -718,19 +726,19 @@ class SSWEM:
         print("numba threads =", get_num_threads())
         print("CFL: dt*f =", dt * np.abs( self.f.max() ) )
         print("CFL: dt*cg/dx =", dt * self.cg / self.dx )
-        print("CFL: dt*epsilon/h_bot =", dt * self.epsilon / self.Ho[-1] )
-        print("CFL: dt*nu_v/h_min^2 =", dt * self.nu_v / ( self.Ho.min()**2 ) )
         if self.cg1 is not None:
             print("CFL: dt*cg1/dx =", dt * self.cg1 / self.dx )
         print("CFL: dt*nu_h/dx^2 =", dt * self.nu_h / self.dx**2 )
+        print("CFL*: dt*epsilon/h_bot =", dt * self.epsilon / self.Ho[-1] )
+        print("CFL*: dt*nu_v/h_min^2 =", dt * self.nu_v / ( self.Ho.min()**2 ) )
         if self.h_zonal_relax > 0:
-            print("CFL: dt*h_zonal_relax =", dt * self.h_zonal_relax )
+            print("CFL*: dt*h_zonal_relax =", dt * self.h_zonal_relax )
         if self.h_relax.max() > 0:
-            print("CFL: dt*h_relax =", dt * self.h_relax.max() )
+            print("CFL*: dt*h_relax =", dt * self.h_relax.max() )
         if self.u_relax.max() > 0:
-            print("CFL: dt*u_relax =", dt * self.u_relax.max() )
+            print("CFL*: dt*u_relax =", dt * self.u_relax.max() )
         if self.v_relax.max() > 0:
-            print("CFL: dt*v_relax =", dt * self.v_relax.max() )
+            print("CFL*: dt*v_relax =", dt * self.v_relax.max() )
         nsteps = nsamps * samp
         print("nsteps =", nsteps)
         Trun = nsteps * dt
