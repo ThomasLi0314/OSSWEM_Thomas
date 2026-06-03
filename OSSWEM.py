@@ -698,7 +698,7 @@ class SSWEM:
                     SSWEM._cubint( self.yh1 / self.Ly, 0.5, 0.6 ) )
         self.h_zonal_target[k, :] = self.Ho[k] + mag * profile
 
-    def set_u_target_jet(self, mag):
+    def set_u_target_jet(self, mag, width=0.1):
         """Sets the u restoring target to a meridional jet profile. mag is the
         per-layer jet amplitude [m s-1]: a scalar (same amplitude in every
         layer) or a length-nk vector (one amplitude per layer). The jet spans
@@ -708,8 +708,8 @@ class SSWEM:
             mag = np.full(self.nk, mag[0])
         elif mag.size != self.nk:
             raise ValueError(f"mag must be a scalar or length nk={self.nk}, got {mag.size}")
-        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.4, 0.5 ) -
-                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.6 ) )
+        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.5 - width, 0.5 ) -
+                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.5 + width ) )
         self.u_target = np.empty_like(self.u)
         for k in range(0,self.nk):
             self.u_target[k, :] = mag[k] * profile
