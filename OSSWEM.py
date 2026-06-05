@@ -221,12 +221,15 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 vort_c  = f[j, i]  + ( v[k,j,i]  - v[k,j,im]  ) * rdx - ( u[k,j,i]  - u[k,jm,i]  ) * rdy
                 r_c     = 1.0 / ( hq_pre[k,j,i] + hsub )
                 qpv_c   = ( vort_c * r_c ) * ( hq_pre[k,j,i] * r_c )
+                # qpv_c   = ( vort_c * r_c )
                 vort_jp = f[jp, i] + ( v[k,jp,i] - v[k,jp,im] ) * rdx - ( u[k,jp,i] - u[k,j,i]   ) * rdy
                 r_jp    = 1.0 / ( hq_pre[k,jp,i] + hsub )
                 qpv_jp  = ( vort_jp * r_jp ) * ( hq_pre[k,jp,i] * r_jp )
+                # qpv_jp  = ( vort_jp * r_jp ) 
                 vort_ip = f[j, ip] + ( v[k,j,ip] - v[k,j,i]   ) * rdx - ( u[k,j,ip] - u[k,jm,ip] ) * rdy
                 r_ip    = 1.0 / ( hq_pre[k,j,ip] + hsub )
                 qpv_ip  = ( vort_ip * r_ip ) * ( hq_pre[k,j,ip] * r_ip )
+                # qpv_ip  = ( vort_ip * r_ip )
 
                 # Bernoulli gradient.
                 Bx = ( B[k,j,i] - B[k,j,im] ) * rdx
@@ -237,6 +240,12 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                             + qpv_jp * 0.5 * ( hv[k,jp,i] + hv[k,jp,im] ) )
                 qhu = 0.5 * ( qpv_c  * 0.5 * ( hu[k,j,i]  + hu[k,jm,i]  )
                             + qpv_ip * 0.5 * ( hu[k,j,ip] + hu[k,jm,ip] ) )
+            
+    
+                # qhv = 0.5 * ( vort_c * 0.5 * ( v[k,j,i]  + v[k,j,im]  )
+                #             + vort_jp * 0.5 * ( v[k,jp,i] + v[k,jp,im] ) )
+                # qhu = 0.5 * ( vort_c  * 0.5 * ( u[k,j,i]  + u[k,jm,i]  )
+                #             + vort_ip * 0.5 * ( u[k,j,ip] + u[k,jm,ip] ) )
 
                 # Stress tensor: nu_h*h*D_tension at h-points {(j,i),(j,im),(jm,i)};
                 # nu_h*hq*D_shear at q-points {(j,i),(jp,i),(j,ip)}.
@@ -698,18 +707,20 @@ class SSWEM:
                     SSWEM._cubint( self.yh1 / self.Ly, 0.5, 0.6 ) )
         self.h_zonal_target[k, :] = self.Ho[k] + mag * profile
 
-    def set_u_target_jet(self, mag, width=0.1):
+    def set_u_target_jet(self, mag, width=60e3):
         """Sets the u restoring target to a meridional jet profile. mag is the
         per-layer jet amplitude [m s-1]: a scalar (same amplitude in every
-        layer) or a length-nk vector (one amplitude per layer). The jet spans
-        y/Ly in [0.4, 0.6] (peak at 0.5)."""
+        layer) or a length-nk vector (one amplitude per layer). width is the
+        jet half-width [m] (default 60 km); the jet is centred on the domain
+        midline (y = Ly/2) and spans [Ly/2 - width, Ly/2 + width]."""
         mag = np.atleast_1d(np.asarray(mag, dtype=float))
         if mag.size == 1:
             mag = np.full(self.nk, mag[0])
         elif mag.size != self.nk:
             raise ValueError(f"mag must be a scalar or length nk={self.nk}, got {mag.size}")
-        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.5 - width, 0.5 ) -
-                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.5 + width ) )
+        hw = width / self.Ly
+        profile = ( SSWEM._cubint( self.yu / self.Ly, 0.5 - hw, 0.5 ) -
+                    SSWEM._cubint( self.yu / self.Ly, 0.5, 0.5 + hw ) )
         self.u_target = np.empty_like(self.u)
         for k in range(0,self.nk):
             self.u_target[k, :] = mag[k] * profile
