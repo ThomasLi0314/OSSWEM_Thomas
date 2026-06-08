@@ -106,8 +106,7 @@ def _orlanski_east(phi, phi_prev, b, rx_out):
                 rx = 0.0
             elif rx > 1.0:
                 rx = 1.0
-            
-            phi[k,j,b] = (phi_prev[k,j,2] + rx * pim1) / (1.0 + rx)
+                phi[k,j,b] = (phi_prev[k,j,2] + rx * pim1) / (1.0 + rx)
 
             sumr += rx
             if rx > maxr:
@@ -1116,8 +1115,11 @@ class SSWEM:
             raise ValueError(f"[OBC-E] stored west data has {h_bc_all.shape[0]} < nsteps={nsteps}")  # [OBC-E]
         
         # Check if the location of the Western open boundary lies in the interior
-        if not (0 <= b < self.ni) or b - 2 <= int(west_cols.max()):     # [OBC-E] b-2 must be interior
-            raise ValueError(f"[OBC-E] b_obc={b} invalid: need west_cols.max()<b-2 and b<ni={self.ni}")  # [OBC-E]
+        if not (2 <= b < self.ni - 1):
+            raise ValueError(f"[OBC-B] b_obc={b} needs 2 <= b < ni-1={self.ni-1}")
+        if np.any((west_cols >= b - 2) & (west_cols <= b)):
+            raise ValueError(f"[OBC-B] prescribed cols must avoid the OBC stencil "
+                             f"{{{b-2},{b-1},{b}}}; got {list(west_cols)}")
         self._print_run_info(dt, nsteps)  
 
         u = np.zeros((nsampes+1, self.nk, self.nj, self.ni))
