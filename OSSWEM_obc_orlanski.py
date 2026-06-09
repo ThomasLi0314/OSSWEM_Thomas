@@ -81,7 +81,7 @@ def _nb_vxuy(u, v, rdx, rdy):
 # OBC Orlanski Implementation [OBC - Orlanski]
 # This is a 1D SCHEME
 @njit(cache=True)
-def _orlanski_east(phi, phi_prev, b, rx_out):
+def _orlanski_east(phi, phi_prev, b_obc, rx_out):
     """
         b here is the column for implementing the orlanski. 
     """
@@ -92,8 +92,8 @@ def _orlanski_east(phi, phi_prev, b, rx_out):
 
     for k in range(nk):
         for j in range(nj):
-            pim1 = phi[k, j, b-1] #phi^{n+1}_{b-1}
-            pim2 = phi[k, j, b-2] #phi^{n+1}_{b-2}
+            pim1 = phi[k, j, b_obc-1] #phi^{n+1}_{b-1}
+            pim2 = phi[k, j, b_obc-2] #phi^{n+1}_{b-2}
             dphi_t = pim1 - phi_prev[k,j, 1] # - phi^n_{b-1}
             dphi_x = pim1 - pim2
             if dphi_x == 0.0:
@@ -104,9 +104,10 @@ def _orlanski_east(phi, phi_prev, b, rx_out):
             # Have question, how to handle the case, why?
             if rx < 0.0:
                 rx = 0.0
-            elif rx > 1.0:
-                rx = 1.0
-                phi[k,j,b] = (phi_prev[k,j,2] + rx * pim1) / (1.0 + rx)
+            else:
+                if rx > 1.0:
+                    rx = 1.0
+                phi[k,j,b_obc] = (phi_prev[k,j,2] + rx * pim1) / (1.0 + rx)
 
             sumr += rx
             if rx > maxr:
@@ -474,6 +475,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
         u_diff[0] = umaxd; u_diff[1] = ( uss / ( nk*nj*n_bc ) )**0.5
         v_diff[0] = vmaxd; v_diff[1] = ( vss / ( nk*nj*n_bc ) )**0.5
     
+    # [OBC - Orlanski]
     if obc_on == 1:
         _orlanski_east(u, u_prev, b_obc, rx_u)
         _orlanski_east(v, v_prev, b_obc, rx_v)
@@ -1100,13 +1102,13 @@ class SSWEM:
         return u, v, h, time, diffs
 
     # [OBC - Orlanski] New Driver for OBC with Orlanski
-    def run_obc(self, dt, samp, nsampes, west_cols, 
+    def run_obc(self, dt, samp, nsampes, prev_cols, 
                 h_bc_all, u_bc_all, v_bc_all, b_obc):
-        """West: prescribe (replace) `west_cols` from stored data each step (the existing  # [OBC-E]
+        """West: prescribe (replace) `prev_cols` from stored data each step (the existing  # [OBC-E]
         sponge-edge band). East: 1D Orlanski radiation at column `b_obc`, computed only    # [OBC-E]
         from interior columns b-1,b-2 (interior-determined; periodicity kept).             # [OBC-E]
         Returns (u,v,h,time), `diffs` (west misfit, ~0), and `rx` (east phase-speed diag)."""  # [OBC-E]
-        west_cols = np.ascontiguousarray(np.asarray(west_cols, dtype=np.int64).ravel()) 
+        prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel()) 
         b = int(b_obc)
 
         nsteps = nsampes * samp
@@ -1117,9 +1119,9 @@ class SSWEM:
         # Check if the location of the Western open boundary lies in the interior
         if not (2 <= b < self.ni - 1):
             raise ValueError(f"[OBC-B] b_obc={b} needs 2 <= b < ni-1={self.ni-1}")
-        if np.any((west_cols >= b - 2) & (west_cols <= b)):
+        if np.any((prev_cols >= b - 2) & (prev_cols <= b)):
             raise ValueError(f"[OBC-B] prescribed cols must avoid the OBC stencil "
-                             f"{{{b-2},{b-1},{b}}}; got {list(west_cols)}")
+                             f"{{{b-2},{b-1},{b}}}; got {list(prev_cols)}")
         self._print_run_info(dt, nsteps)  
 
         u = np.zeros((nsampes+1, self.nk, self.nj, self.ni))
@@ -1147,7 +1149,7 @@ class SSWEM:
 
             # advance
             # To turn off prescribing, set the second argument to 0. 
-            self._step_core(dt, 0, west_cols, 
+            self._step_core(dt, 2, prev_cols, 
                             h_bc_all[it - 1], u_bc_all[it - 1], v_bc_all[it - 1],
                             h_diff, u_diff, v_diff,
                             obc_on = 1, b_obc = b,
@@ -1181,7 +1183,8 @@ class SSWEM:
         
     # [OBC] single _step_numba call site, shared by step() (bc_mode=0) and the
     # [OBC] boundary record/replace runs. Advances time/iter after the JIT step.
-    def _step_core(self, dt, bc_mode, bc_cols,
+    def _step_core(self, dt, bc_mode, bc_cols,\
+                   # [OBC] setting
                    h_bc, u_bc, v_bc, h_diff, u_diff, v_diff,
                    # [OBC - Orlanski] Settings
                    obc_on = 0, b_obc = 0, 
