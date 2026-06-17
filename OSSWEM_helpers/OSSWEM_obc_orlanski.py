@@ -81,9 +81,10 @@ def _nb_vxuy(u, v, rdx, rdy):
 # OBC Orlanski Implementation [OBC - Orlanski]
 # This is a 1D SCHEME
 @njit(cache=True)
-def _orlanski_east(phi, phi_prev, b_obc, rx_out):
+def _orlanski_east(phi, phi_prev, b_obc, rx_out, phi_ext):
     """
         b here is the column for implementing the orlanski. 
+        phi_ext is the external forcing term (recorded from the control run at b_obc column)
     """
     nk, nj, ni = phi.shape
     # Initial two variables for diagonise, sum is used for average, max is used for maximum.
@@ -94,7 +95,7 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out):
         for j in range(nj):
             pim1 = phi[k, j, b_obc-1] #phi^{n+1}_{b-1}
             pim2 = phi[k, j, b_obc-2] #phi^{n+1}_{b-2}
-            dphi_t = pim1 - phi_prev[k,j, 1] # - phi^n_{b-1}
+            dphi_t = pim1 - phi_prev[k,j, 0] # - phi^n_{b-1}
             dphi_x = pim1 - pim2
             if dphi_x == 0.0:
                 rx = 0.0
@@ -104,10 +105,11 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out):
             # Have question, how to handle the case, why?
             if rx < 0.0:
                 rx = 0.0
+                phi[k, j, b_obc] = phi_ext[k, j]
             else:
                 if rx > 1.0:
                     rx = 1.0
-                phi[k,j,b_obc] = (phi_prev[k,j,2] + rx * pim1) / (1.0 + rx)
+                phi[k,j,b_obc] = (phi_prev[k,j,1] + rx * pim1) / (1.0 + rx)
 
             sumr += rx
             if rx > maxr:
@@ -123,8 +125,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 h_zonal_relax, h_relax, u_relax, v_relax,
                 h_relax_on, u_relax_on, v_relax_on, hsub, iter_num,
                 bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff,
-                obc_on, b_obc, h_prev, u_prev, v_prev, rx_h, rx_u, rx_v
-                ):  # Updated the last column of input for Orlanski [OBC - Orlanski]
+                obc_on, b_obc, h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,
+                h_ext, u_ext, v_ext):  # Updated the last column of input for Orlanski [OBC - Orlanski]
     """JIT-compiled, multi-threaded time step. Modifies u, v, h in place; state
     arrays have shape (nk, nj, ni). The work is organized as fused loops that
     recompute stencil quantities inline rather than building full-grid
@@ -156,8 +158,6 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     Re(delta_w) gives delta_u; Im(delta_w) gives delta_v.
     
     obc_on int (0/1) for whether turn on or off of orlanski boundary condition. 
-
-
     """
 
     nk, nj, ni = u.shape
@@ -240,7 +240,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     
     # [OBC - Orlanski]
     if obc_on == 1:
-        _orlanski_east(h, h_prev, b_obc, rx_h)
+        _orlanski_east(h, h_prev, b_obc, rx_h, h_ext)
 
     # Interface positions eta (cumulative from bottom) and Montgomery potential
     # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
@@ -477,8 +477,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     
     # [OBC - Orlanski]
     if obc_on == 1:
-        _orlanski_east(u, u_prev, b_obc, rx_u)
-        _orlanski_east(v, v_prev, b_obc, rx_v)
+        _orlanski_east(u, u_prev, b_obc, rx_u, u_ext)
+        _orlanski_east(v, v_prev, b_obc, rx_v, v_ext)
 
     # --- restoring (backward Euler) ---
     # Applied after the dynamics, so each field relaxes implicitly toward its
@@ -647,6 +647,7 @@ class SSWEM:
         self._diff_dummy = np.zeros(2)
         # [OBC - Orlanski]
         self._obc_prev_dummy = np.zeros((self.nk, self.nj, 3)) #place holder.
+        self._obc_ext_dummy = np.zeros((self.nk, self.nj)) # place holder
 
 
         # Derived parameters
@@ -1103,7 +1104,8 @@ class SSWEM:
 
     # [OBC - Orlanski] New Driver for OBC with Orlanski
     def run_obc(self, dt, samp, nsampes, prev_cols, 
-                h_bc_all, u_bc_all, v_bc_all, b_obc):
+                h_bc_all, u_bc_all, v_bc_all, b_obc,
+                h_ext_all, u_ext_all, v_ext_all):
         """West: prescribe (replace) `prev_cols` from stored data each step (the existing  # [OBC-E]
         sponge-edge band). East: 1D Orlanski radiation at column `b_obc`, computed only    # [OBC-E]
         from interior columns b-1,b-2 (interior-determined; periodicity kept).             # [OBC-E]
@@ -1131,9 +1133,9 @@ class SSWEM:
         u[0] = self.u; v[0] = self.v; h[0] = self.h; time[0] = self.time
 
         # phi_n at {b-2, b-1, b}
-        h_prev = np.zeros((self.nk, self.nj, 3))  # [OBC - Orlanski]
-        u_prev = np.zeros((self.nk, self.nj, 3))  # [OBC - Orlanski]
-        v_prev = np.zeros((self.nk, self.nj, 3))  # [OBC - Orlanski]
+        h_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
+        u_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
+        v_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
 
         rx_h = np.zeros(2); rx_u = np.zeros(2); rx_v = np.zeros(2)  # [OBC - Orlanski] phase-speed diags at b-1,b
         h_diff = np.zeros(2); u_diff = np.zeros(2); v_diff = np.zeros(2)  # [OBC - Orlanski] diffs for diagnostics
@@ -1143,9 +1145,9 @@ class SSWEM:
         nrun = nsteps
         for it in range(1, nsteps + 1):
             # snap shot phi^n before the step
-            h_prev[:] = self.h[:, :, b-2:b+1]  
-            u_prev[:] = self.u[:, :, b-2:b+1] 
-            v_prev[:] = self.v[:, :, b-2:b+1]
+            h_prev[:] = self.h[:, :, b-1:b+1]  
+            u_prev[:] = self.u[:, :, b-1:b+1] 
+            v_prev[:] = self.v[:, :, b-1:b+1]
 
             # advance
             # To turn off prescribing, set the second argument to 0. 
@@ -1154,7 +1156,8 @@ class SSWEM:
                             h_diff, u_diff, v_diff,
                             obc_on = 1, b_obc = b,
                             h_prev = h_prev, u_prev = u_prev, v_prev = v_prev,
-                            rx_h = rx_h, rx_u = rx_u, rx_v = rx_v)
+                            rx_h = rx_h, rx_u = rx_u, rx_v = rx_v,
+                            h_ext = h_ext_all[it - 1], u_ext = u_ext_all[it - 1], v_ext = v_ext_all[it - 1]) # External forcing term. 
             rxh[it-1] = rx_h; rxu[it-1] = rx_u; rxv[it-1] = rx_v  # [OBC - Orlanski] store phase speeds for diag
 
             if np.any(np.isnan(self.u)):
@@ -1189,7 +1192,8 @@ class SSWEM:
                    # [OBC - Orlanski] Settings
                    obc_on = 0, b_obc = 0, 
                    h_prev = None, u_prev = None, v_prev = None,
-                   rx_h = None, rx_u = None, rx_v = None):
+                   rx_h = None, rx_u = None, rx_v = None,
+                   h_ext=None, u_ext=None, v_ext=None): # External forcing terms
         # Sponge gates are cached by the h/u/v_relax setters (a bool keeps the
         # JIT argument types stable and lets numba skip a term when its sponge
         # is off), so no per-step recomputation is needed.
@@ -1198,6 +1202,9 @@ class SSWEM:
         if h_prev is None : h_prev = self._obc_prev_dummy
         if u_prev is None : u_prev = self._obc_prev_dummy
         if v_prev is None : v_prev = self._obc_prev_dummy
+        if h_ext is None: h_ext = self._obc_ext_dummy
+        if u_ext is None: u_ext = self._obc_ext_dummy
+        if v_ext is None: v_ext = self._obc_ext_dummy
         if rx_h is None : rx_h = self._diff_dummy
         if rx_u is None : rx_u = self._diff_dummy
         if rx_v is None : rx_v = self._diff_dummy
@@ -1211,7 +1218,8 @@ class SSWEM:
                     self._h_relax_on, self._u_relax_on, self._v_relax_on,
                     self.hsub, self.iter,
                     bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff, #  [OBC]
-                    obc_on, int(b_obc), h_prev, u_prev, v_prev, rx_h, rx_u, rx_v)  # [OBC - Orlanski]
+                    obc_on, int(b_obc), h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,  # [OBC - Orlanski]
+                    h_ext, u_ext, v_ext) # For external forcing term
         self.time += dt
         self.iter += 1
 

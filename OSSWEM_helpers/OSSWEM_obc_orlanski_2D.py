@@ -82,52 +82,73 @@ def _nb_vxuy(u, v, rdx, rdy):
 # OBC Orlanski Implementation [OBC - Orlanski]
 # This is a 1D SCHEME
 @njit(cache=True)
-def _orlanski_east(phi, phi_prev, b_obc, rx_out, rx_field, rx_mode):  # [OBC-UVfromH] +rx_field, rx_mode
+def _orlanski_east(phi, phi_prev, b_obc, rx_out,
+                   nudging_mode, phi_ext, alpha_in):  # [OBC - Orlanski - 2D - IndepRx] dropped rx_field/rx_mode; +nudging_mode, phi_ext, alpha_in
     """
         b here is the column for implementing the orlanski.
 
-        rx_mode (per-point phase-speed source):                              # [OBC-UVfromH]
-          0 -> COMPUTE rx from phi's own (dphi_t/dphi_x) -- the original      # [OBC-UVfromH]
-               per-field estimate -- and ALSO store it into rx_field[k,j] so  # [OBC-UVfromH]
-               another field can reuse it (used for h).                       # [OBC-UVfromH]
-          1 -> REUSE the per-point phase speed already in rx_field[k,j]       # [OBC-UVfromH]
-               instead of estimating from phi (used to drive u,v with h's     # [OBC-UVfromH]
-               phase speed). phi_prev / b-2 are not consulted for rx here.    # [OBC-UVfromH]
-        rx_field : (nk, nj) scratch. A negative entry is the sentinel         # [OBC-UVfromH]
-               "inflow -> do NOT radiate" (boundary keeps its freely-evolved  # [OBC-UVfromH]
-               value), so the rx<0 branch is reproduced faithfully on reuse.  # [OBC-UVfromH]
+          0 -> PRESCRIBE scheme: on inflow HARD-prescribe column b to the     # [OBC - Orlanski - 2D - Prescribe]
+               recorded external solution, phi_b^{n+1} = phi_ext
+          1 -> NUDGING scheme: on inflow SOFT-prescribe column b toward the recorded external solution phi_ext,                         
+                 phi_b^{n+1} = phi_b^n + alpha_in*(phi_ext - phi_b^n),       
+            This is the paper's adaptive scheme (alpha_in=1 == hard prescribe).   
+        phi_ext : (nk, nj) external (recorded) value of THIS field at column
+               b for the current step; read on inflow in BOTH modes.           # [OBC - Orlanski - 2D - Prescribe]
+        alpha_in : inflow nudging coefficient in (0,1]; only used if nudging. 
+        Outflow is ALWAYS pure radiation in both modes (no nudge applied).  
+
+        Input
+        phi_prev = phi[k, all j, b-1:b] here k for layer
     """
     nk, nj, ni = phi.shape
     # Initial two variables for diagonise, sum is used for average, max is used for maximum.
-    maxr = 0.0
-    sumr = 0.0
+    maxr = 0.0;    sumr = 0.0
 
     for k in range(nk):
         for j in range(nj):
-            pim1 = phi[k, j, b_obc-1] #phi^{n+1}_{b-1}
-            rx = 0.0                                          # Set rx = 0.0 for mode 1. 
-            if rx_mode == 0:                                  # [OBC-UVfromH] estimate rx from this field
-                pim2 = phi[k, j, b_obc-2] #phi^{n+1}_{b-2}
-                dphi_t = pim1 - phi_prev[k,j, 1] # - phi^n_{b-1}
-                dphi_x = pim1 - pim2
-                if dphi_x == 0.0:
-                    rx = 0.0
-                else:
-                    rx = -dphi_t / dphi_x
-                # Have question, how to handle the case, why?
-                if rx < 0.0:
-                    rx_field[k, j] = -1.0                     # [OBC-UVfromH] inflow sentinel
-                # elif rx > 1.0:
-                #     rx_field[k, j] = 1.0                    
-                else:
-                    rx_field[k, j] = rx                      
-            rxf = rx_field[k, j]                            
+            # For y periodic
+            jm = j - 1 if j > 0 else nj - 1 # For row just south of j
+            jp = j + 1 if j < nj - 1 else 0 # m for minus, p for plus
+            pim1 = phi[k, j, b_obc-1] #phi^{n+1}_{b-1, j}
+            pim2 = phi[k, j, b_obc-2] #phi^{n+1}_{b-2, j}     
 
-            if rxf < 0.0:                                  
-                rx = 0.0                                   
+            dphi_t = pim1 - phi_prev[k, j, 0]           
+            dphi_x = pim1 - pim2                            
+
+            # centeral difference
+            cen = phi_prev[k, jp, 0] - phi_prev[k, jm, 0] #phi^n_{b-1, j+1} - phi^n_{b-1, j-1}
+            if dphi_t * cen > 0.0:
+                dphi_y = phi_prev[k, j, 0] - phi_prev[k, jm, 0] # phi_{b-1, j} - phi_{b-1, j-1}
             else:
-                rx = rxf                                     
-                phi[k,j,b_obc] = (phi_prev[k,j,2] + rx * pim1) / (1.0 + rx)  # [OBC-UVfromH] radiate
+                dphi_y = phi_prev[k, jp, 0] - phi_prev[k, j, 0] # phi_{b-1, j+1} - phi_{b-1, j}
+
+            denom = dphi_x*dphi_x + dphi_y*dphi_y # THis is the norm of gradient
+
+            if denom == 0.0:                                          
+                rx = 0.0; ry = 0.0
+            else:
+                rx = -dphi_t * dphi_x / denom
+                ry = -dphi_t * dphi_y / denom
+
+            if rx < 0.0: # inflow
+                rx = 0.0
+                if nudging_mode == 1:   # [OBC - Orlanski - 2D - Nuding]
+                    # phi_b^{n+1} = 
+                    phi[k, j, b_obc] = phi_prev[k, j, 1] + alpha_in * (phi_ext[k, j] - phi_prev[k, j, 1])
+                else:
+                    phi[k, j, b_obc] = phi_ext[k, j]
+            else: # Outflow
+                if rx > 1.0: rx = 1.0
+                if ry > 1.0: ry = 1.0     
+                elif ry < -1.0: ry = -1.0                      
+       # [OBC - Orlanski - 2D - IndepRx]
+                if ry >= 0.0:
+                    dy_b = phi_prev[k, j, 1] - phi_prev[k, jm, 1] # phi^n_{b,j} - \phi_{b, j-1}
+                else:  
+                    dy_b = phi_prev[k, jp, 1] - phi_prev[k, j, 1] # phi^n_{b,j+1} - \phi_{b, j}                  
+
+                # The 2D Orlanski Scheme
+                phi[k, j, b_obc] = (phi_prev[k, j, 1] + rx * pim1 - ry * dy_b) / (1.0 + rx)
 
             sumr += rx
             if rx > maxr:
@@ -144,7 +165,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 h_relax_on, u_relax_on, v_relax_on, hsub, iter_num,
                 bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff,
                 obc_on, b_obc, h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,
-                rx_field, uv_from_h  # [OBC-UVfromH] shared per-point phase-speed scratch + toggle
+                nudging_mode, h_ext, u_ext, v_ext, alpha_in  # [OBC - Orlanski - 2D - Nuding] inflow scheme + external (recorded) col-b data; [OBC - Orlanski - 2D - IndepRx] 
                 ):  # Updated the last column of input for Orlanski [OBC - Orlanski]
     """JIT-compiled, multi-threaded time step. Modifies u, v, h in place; state
     arrays have shape (nk, nj, ni). The work is organized as fused loops that
@@ -261,7 +282,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     
     # [OBC - Orlanski]
     if obc_on == 1:
-        _orlanski_east(h, h_prev, b_obc, rx_h, rx_field, 0)  # [OBC-UVfromH] h always estimates & stores rx
+        _orlanski_east(h, h_prev, b_obc, rx_h,
+                       nudging_mode, h_ext, alpha_in)  # [OBC - Orlanski - 2D - IndepRx] h estimates its own rx; +nudging args
 
     # Interface positions eta (cumulative from bottom) and Montgomery potential
     # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
@@ -498,10 +520,11 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     
     # [OBC - Orlanski]
     if obc_on == 1:
-        # [OBC-UVfromH] uv_from_h=1 -> reuse h's stored rx_field (rx_mode=1, read-only so
-        # [OBC-UVfromH] both u and v see h's values); uv_from_h=0 -> original per-field estimate.
-        _orlanski_east(u, u_prev, b_obc, rx_u, rx_field, uv_from_h)  # [OBC-UVfromH]
-        _orlanski_east(v, v_prev, b_obc, rx_v, rx_field, uv_from_h)  # [OBC-UVfromH]
+        # [OBC - Orlanski - 2D - IndepRx] u and v each estimate their own phase speed.
+        _orlanski_east(u, u_prev, b_obc, rx_u,
+                       nudging_mode, u_ext, alpha_in)  # [OBC - Orlanski - 2D - Nuding] +nudging args
+        _orlanski_east(v, v_prev, b_obc, rx_v,
+                       nudging_mode, v_ext, alpha_in)  # [OBC - Orlanski - 2D - Nuding] +nudging args
 
     # --- restoring (backward Euler) ---
     # Applied after the dynamics, so each field relaxes implicitly toward its
@@ -660,20 +683,13 @@ class SSWEM:
         self.u_relax = u_relax
         self.v_relax = v_relax
 
-        # [OBC] cached dummy arrays so the normal step path passes the boundary
-        # [OBC] record/replace args to _step_numba with bc_mode=0 (a no-op) without
-        # [OBC] per-step allocation. Real (nk,nj,n_bc) / (n_bc,) arrays are passed only
-        # [OBC] by run_record_bc / run_replace_bc; here a single-column placeholder is
-        # [OBC] enough since the blocks are skipped when bc_mode=0.
         self._bc_cols_dummy = np.zeros(1, dtype=np.int64)
         self._bc_dummy = np.zeros((self.nk, self.nj, 1))
         self._diff_dummy = np.zeros(2)
         # [OBC - Orlanski]
-        self._obc_prev_dummy = np.zeros((self.nk, self.nj, 3)) #place holder.
-        # [OBC-UVfromH] (nk,nj) scratch for the shared per-point Orlanski phase speed.
-        # [OBC-UVfromH] Unused on the bc_mode=0 / obc_on=0 path, but passed so the JIT
-        # [OBC-UVfromH] argument types stay fixed.
-        self._obc_rxfield_dummy = np.zeros((self.nk, self.nj))
+        self._obc_prev_dummy = np.zeros((self.nk, self.nj, 2)) #place holder.
+        # [OBC - Orlanski - 2D - Nuding] (nk,nj) scratch for the external col-b data passed when nudging is off
+        self._obc_ext_dummy = np.zeros((self.nk, self.nj))
 
 
         # Derived parameters
@@ -1131,26 +1147,62 @@ class SSWEM:
     # [OBC - Orlanski] New Driver for OBC with Orlanski
     def run_obc(self, dt, samp, nsampes, prev_cols,
                 h_bc_all, u_bc_all, v_bc_all, b_obc,
-                uv_from_h=True):  # [OBC-UVfromH] tie (u,v) phase speed to h's
+                nudging=False, h_ext_all=None, u_ext_all=None, v_ext_all=None,
+                alpha_in=0.5):  # [OBC - Orlanski - 2D - Nuding] inflow scheme selector + external col-b data; [OBC - Orlanski - 2D - IndepRx] dropped uv_from_h
         """West: prescribe (replace) `prev_cols` from stored data each step (the existing  # [OBC-E]
         sponge-edge band). East: 1D Orlanski radiation at column `b_obc`, computed only    # [OBC-E]
         from interior columns b-1,b-2 (interior-determined; periodicity kept).             # [OBC-E]
         Returns (u,v,h,time), `diffs` (west misfit, ~0), and `rx` (east phase-speed diag).
 
-        uv_from_h : if True (default), the east-boundary phase speed r_x is estimated   # [OBC-UVfromH]
-            ONCE from h and that same per-point r_x is reused to radiate u and v -- the  # [OBC-UVfromH]
-            (u,v) estimate blows up on its own, so this stabilizes them. If False, each  # [OBC-UVfromH]
-            field estimates its own r_x (the original per-field Orlanski).               # [OBC-UVfromH]
+        Each field (h, u, v) estimates its OWN east-boundary phase speed r_x      # [OBC - Orlanski - 2D - IndepRx]
+        independently (no shared / reused phase speed).                           # [OBC - Orlanski - 2D - IndepRx]
+
+        nudging : INFLOW treatment knob for the east OBC column.
+            False (default) -> PRESCRIBE scheme: on inflow hard-set column b to     # [OBC - Orlanski - 2D - Prescribe]
+                  the recorded external data (h/u/v_ext_all), as in the 1D          # [OBC - Orlanski - 2D - Prescribe]
+                  OSSWEM_obc_orlanski.                                              # [OBC - Orlanski - 2D - Prescribe]
+            True  -> NUDGING scheme: on inflow soft-prescribe column b toward the
+                  recorded external data (h/u/v_ext_all) with coefficient alpha_in, so
+                  the ghost wall is removed (pass prev_cols WITHOUT b+1).
+        h_ext_all, u_ext_all, v_ext_all : per-step external (recorded) col-b data,       
+            shape (>=nsteps, nk, nj) or (>=nsteps, nk, nj, 1) (e.g. a run_record_bc     
+            probe at probe_i0=b_obc). REQUIRED when nudging=True, ignored otherwise.    
+        alpha_in : inflow nudging coefficient in (0,1]; 1 == hard prescribe.            
         """
         prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())
         b = int(b_obc)
-        uv_from_h = int(bool(uv_from_h))  # [OBC-UVfromH] -> 0/1 for the JIT step
+        nudging_mode = int(bool(nudging))  # [OBC - Orlanski - 2D - Nuding] 0=prescribe, 1=inflow nudging
+        alpha_in = float(alpha_in)         # [OBC - Orlanski - 2D - Nuding]
 
         nsteps = nsampes * samp
         # Check if the shape of the stored boundary data matches the expected shape based on nsteps and bc_cols.
         if h_bc_all.shape[0] < nsteps:
             raise ValueError(f"[OBC-E] stored west data has {h_bc_all.shape[0]} < nsteps={nsteps}")  # [OBC-E]
-        
+
+
+        # [OBC - Orlanski - 2D - PrescribeFix] ext col-b data is read on inflow in BOTH
+        # modes (hard-prescribe when nudging=False, soft when True), so it is ALWAYS required.
+        # Check if the exterior value is prepaerd
+        if h_ext_all is None or u_ext_all is None or v_ext_all is None:
+            raise ValueError("[OBC - Orlanski - 2D - Nuding] run_obc needs h_ext_all/u_ext_all/"
+                             "v_ext_all (recorded col-b external data, e.g. run_record_bc probe "
+                             "with probe_i0=b_obc).")
+        # Prepare the exterior data
+        def _prep_ext(a, name):
+            a = np.asarray(a, dtype=np.float64)
+            if a.ndim == 4 and a.shape[-1] == 1:
+                a = a[..., 0]
+            if a.ndim != 3 or a.shape[1:] != (self.nk, self.nj):
+                raise ValueError(f"[OBC - Orlanski - 2D - Nuding] {name} must be (>=nsteps,nk,nj) "
+                                 f"or (>=nsteps,nk,nj,1); got {a.shape}")
+            if a.shape[0] < nsteps:
+                raise ValueError(f"[OBC - Orlanski - 2D - Nuding] {name} has {a.shape[0]} < "
+                                 f"nsteps={nsteps}")
+            return np.ascontiguousarray(a)
+        h_ext_all = _prep_ext(h_ext_all, "h_ext_all")
+        u_ext_all = _prep_ext(u_ext_all, "u_ext_all")
+        v_ext_all = _prep_ext(v_ext_all, "v_ext_all")
+
         # Check if the location of the Western open boundary lies in the interior
         if not (2 <= b < self.ni - 1):
             raise ValueError(f"[OBC-B] b_obc={b} needs 2 <= b < ni-1={self.ni-1}")
@@ -1166,34 +1218,37 @@ class SSWEM:
         u[0] = self.u; v[0] = self.v; h[0] = self.h; time[0] = self.time
 
         # phi_n at {b-2, b-1, b}
-        h_prev = np.zeros((self.nk, self.nj, 3))  # [OBC - Orlanski]
-        u_prev = np.zeros((self.nk, self.nj, 3))  # [OBC - Orlanski]
-        v_prev = np.zeros((self.nk, self.nj, 3))  # [OBC - Orlanski]
+        h_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
+        u_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
+        v_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
 
         rx_h = np.zeros(2); rx_u = np.zeros(2); rx_v = np.zeros(2)  # [OBC - Orlanski] phase-speed diags at b-1,b
         h_diff = np.zeros(2); u_diff = np.zeros(2); v_diff = np.zeros(2)  # [OBC - Orlanski] diffs for diagnostics
         rxh = np.zeros((nsteps, 2)); rxu = np.zeros((nsteps, 2)); rxv = np.zeros((nsteps, 2))  # [OBC - Orlanski] phase speeds for diagnostics
-        rx_field = np.zeros((self.nk, self.nj))  # [OBC-UVfromH] shared per-point r_x: h writes it, (u,v) reuse it
-        print(f"[OBC-UVfromH] east r_x source for (u,v): "  # [OBC-UVfromH]
-              f"{'h (shared)' if uv_from_h else 'own per-field estimate'}")  # [OBC-UVfromH]
+        print("[OBC - Orlanski - 2D - IndepRx] east r_x estimated independently per field (h, u, v)")  # [OBC - Orlanski - 2D - IndepRx]
+        print(f"[OBC - Orlanski - 2D - Nuding] east inflow scheme: "  # [OBC - Orlanski - 2D - Nuding]
+              f"{f'NUDGING (alpha_in={alpha_in:.3g}, ghost wall removed)' if nudging_mode else 'PRESCRIBE (hard-set col b = external)'}")  # [OBC - Orlanski - 2D - Prescribe]
 
         nsamp = 0
         nrun = nsteps
         for it in range(1, nsteps + 1):
             # snap shot phi^n before the step
-            h_prev[:] = self.h[:, :, b-2:b+1]  
-            u_prev[:] = self.u[:, :, b-2:b+1] 
-            v_prev[:] = self.v[:, :, b-2:b+1]
+            h_prev[:] = self.h[:, :, b-1:b+1]  
+            u_prev[:] = self.u[:, :, b-1:b+1] 
+            v_prev[:] = self.v[:, :, b-1:b+1]
 
+            # [OBC - Orlanski - 2D - PrescribeFix] external col-b slice; read on inflow in BOTH modes
+            h_ext_s = h_ext_all[it - 1]; u_ext_s = u_ext_all[it - 1]; v_ext_s = v_ext_all[it - 1]
             # advance
-            # To turn off prescribing, set the second argument to 0. 
+            # To turn off prescribing, set the second argument to 0.
             self._step_core(dt, 2, prev_cols,
                             h_bc_all[it - 1], u_bc_all[it - 1], v_bc_all[it - 1],
                             h_diff, u_diff, v_diff,
                             obc_on = 1, b_obc = b,
                             h_prev = h_prev, u_prev = u_prev, v_prev = v_prev,
                             rx_h = rx_h, rx_u = rx_u, rx_v = rx_v,
-                            rx_field = rx_field, uv_from_h = uv_from_h)  # [OBC-UVfromH]
+                            nudging_mode = nudging_mode, h_ext = h_ext_s,  # [OBC - Orlanski - 2D - Nuding]
+                            u_ext = u_ext_s, v_ext = v_ext_s, alpha_in = alpha_in)  # [OBC - Orlanski - 2D - Nuding]
             rxh[it-1] = rx_h; rxu[it-1] = rx_u; rxv[it-1] = rx_v  # [OBC - Orlanski] store phase speeds for diag
 
             if np.any(np.isnan(self.u)):
@@ -1229,7 +1284,7 @@ class SSWEM:
                    obc_on = 0, b_obc = 0,
                    h_prev = None, u_prev = None, v_prev = None,
                    rx_h = None, rx_u = None, rx_v = None,
-                   rx_field = None, uv_from_h = 0):  # [OBC-UVfromH] shared phase-speed scratch + toggle
+                   nudging_mode = 0, h_ext = None, u_ext = None, v_ext = None, alpha_in = 0.0):  # [OBC - Orlanski - 2D - Nuding]; [OBC - Orlanski - 2D - IndepRx] dropped rx_field/uv_from_h
         # Sponge gates are cached by the h/u/v_relax setters (a bool keeps the
         # JIT argument types stable and lets numba skip a term when its sponge
         # is off), so no per-step recomputation is needed.
@@ -1241,8 +1296,10 @@ class SSWEM:
         if rx_h is None : rx_h = self._diff_dummy
         if rx_u is None : rx_u = self._diff_dummy
         if rx_v is None : rx_v = self._diff_dummy
-        # [OBC-UVfromH]
-        if rx_field is None : rx_field = self._obc_rxfield_dummy
+        # [OBC - Orlanski - 2D - Nuding] external col-b data (read on inflow; nudging_mode==1 soft, ==0 hard-prescribe)
+        if h_ext is None : h_ext = self._obc_ext_dummy
+        if u_ext is None : u_ext = self._obc_ext_dummy
+        if v_ext is None : v_ext = self._obc_ext_dummy
 
         _step_numba(self.u, self.v, self.h, self.D, self.taux, self.tauy,
                     self.f, self.f_at_u, self.f_at_v,
@@ -1254,7 +1311,7 @@ class SSWEM:
                     self.hsub, self.iter,
                     bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff, #  [OBC]
                     obc_on, int(b_obc), h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,  # [OBC - Orlanski]
-                    rx_field, int(uv_from_h))  # [OBC-UVfromH]
+                    int(nudging_mode), h_ext, u_ext, v_ext, float(alpha_in))  # [OBC - Orlanski - 2D - Nuding]
         self.time += dt
         self.iter += 1
 

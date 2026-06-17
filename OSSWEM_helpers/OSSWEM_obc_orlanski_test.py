@@ -499,8 +499,10 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     if obc_on == 1:
         # [OBC-UVfromH] uv_from_h=1 -> reuse h's stored rx_field (rx_mode=1, read-only so
         # [OBC-UVfromH] both u and v see h's values); uv_from_h=0 -> original per-field estimate.
-        _orlanski_east(u, u_prev, b_obc, rx_u, rx_field, uv_from_h)  # [OBC-UVfromH]
-        _orlanski_east(v, v_prev, b_obc, rx_v, rx_field, uv_from_h)  # [OBC-UVfromH]
+        # _orlanski_east(u, u_prev, b_obc, rx_u, rx_field, uv_from_h)  # [OBC-UVfromH]
+        _orlanski_east(u, u_prev, b_obc, rx_u, rx_field, 0)
+        # _orlanski_east(v, v_prev, b_obc, rx_v, rx_field, uv_from_h)  # [OBC-UVfromH]
+        _orlanski_east(v, v_prev, b_obc, rx_v, rx_field, 0)  # [OBC-UVfromH]
 
     # --- restoring (backward Euler) ---
     # Applied after the dynamics, so each field relaxes implicitly toward its
