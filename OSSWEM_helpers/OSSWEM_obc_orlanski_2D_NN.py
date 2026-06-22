@@ -138,9 +138,9 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
                 else:
                     phi[k, j, b_obc] = phi_ext[k, j]
             else: # Outflow
-                if rx > 3.0: rx = 3.0
-                if ry > 3.0: ry = 3.0     
-                elif ry < -3.0: ry = -3.0                      
+                if rx > 1.0: rx = 1.0
+                if ry > 1.0: ry = 1.0     
+                elif ry < -1.0: ry = -1.0                      
        # [OBC - Orlanski - 2D - IndepRx]
                 if ry >= 0.0:
                     dy_b = phi_prev[k, j, 1] - phi_prev[k, jm, 1] # phi^n_{b,j} - \phi_{b, j-1}
@@ -157,6 +157,46 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
     rx_out[1] = maxr
 
 
+# ===================== Lifted (numpy) east-Orlanski OBC for the NN path =====================  # 
+# Plain-numpy mirror of helper/orlanski_scheme.py (torch). Used by run_obc_nn, which LIFTS the   # 
+# OBC out of the @njit step so a torch network can supply (cx, cy) -- torch cannot run inside     # 
+# numba nopython. Packed stencil X8 (..., 8), RAW physical values:                                # 
+#   0:(b-1,j-1)@n  1:(b-1,j)@n  2:(b-1,j+1)@n   3:(b,j-1)@n  4:(b,j)@n  5:(b,j+1)@n                # 
+#   6:(b-1,j)@n+1 = pim1        7:(b-2,j)@n+1 = pim2                                               # 
+def _phase_inflow_np(X8):                                                                          # 
+    """Analytic per-point (cx, cy) + inflow flag from the packed stencil (numpy). Faithful copy   # 
+    of the estimation branch of _orlanski_east; cx in [0,1], cy in [-1,1], inflow == (raw cx<0)."""# 
+    pim1, pim2            = X8[..., 6], X8[..., 7]                                                 # 
+    bm1_jm, bm1_j, bm1_jp = X8[..., 0], X8[..., 1], X8[..., 2]                                     # 
+    dphi_t = pim1 - bm1_j                                                                          # 
+    dphi_x = pim1 - pim2                                                                           # 
+    cen    = bm1_jp - bm1_jm                                                                       # 
+    dphi_y = np.where(dphi_t * cen > 0.0, bm1_j - bm1_jm, bm1_jp - bm1_j)                          #  upwind in j
+    denom  = dphi_x * dphi_x + dphi_y * dphi_y                                                     # 
+    safe   = denom > 0.0                                                                           # 
+    denom_s = np.where(safe, denom, 1.0)                                                           #  avoid 0-div
+    cx = np.where(safe, -dphi_t * dphi_x / denom_s, 0.0)                                           # 
+    cy = np.where(safe, -dphi_t * dphi_y / denom_s, 0.0)                                           # 
+    inflow = cx < 0.0                                                                              #  rx<0 -> inflow
+    cx = np.clip(cx, 0.0, 1.0)                                                                     # 
+    cy = np.clip(cy, -1.0, 1.0)                                                                    # 
+    return cx, cy, inflow                                                                          # 
+
+
+def _obc_update_np(X8, cx, cy, inflow, phi_ext, alpha_in):                                         # 
+    """East-Orlanski boundary update (numpy), faithful to _orlanski_east.                          # 
+    OUTFLOW: phi_b = (phi_prev_b + cx*pim1 - cy*dy_b)/(1+cx).                                       # 
+    INFLOW : phi_b = phi_prev_b + alpha_in*(phi_ext - phi_prev_b)  (cx,cy unused; alpha_in=1 == hard prescribe)."""  # 
+    phi_prev_b_j = X8[..., 4]    # (b, j)   @ n                                                    # 
+    pim1         = X8[..., 6]    # (b-1, j) @ n+1                                                  # 
+    b_jm         = X8[..., 3]    # (b, j-1) @ n                                                    # 
+    b_jp         = X8[..., 5]    # (b, j+1) @ n                                                    # 
+    dy_b = np.where(cy >= 0.0, phi_prev_b_j - b_jm, b_jp - phi_prev_b_j)                           # 
+    rad  = (phi_prev_b_j + cx * pim1 - cy * dy_b) / (1.0 + cx)                                     # 
+    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)                                     # 
+    return np.where(inflow, nudge, rad)                                                            # 
+
+
 @njit(parallel=True, cache=True)
 def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 dt, dx, dy, g, epsilon, nu_h, nu_v, alpha_f, alpha_nu,
@@ -165,8 +205,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 h_relax_on, u_relax_on, v_relax_on, hsub, iter_num,
                 bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff,
                 obc_on, b_obc, h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,
-                nudging_mode, h_ext, u_ext, v_ext, alpha_in,  # [OBC - Orlanski - 2D - Nuding] inflow scheme + external (recorded) col-b data; [OBC - Orlanski - 2D - IndepRx]
-                h_zerograd                                    # 1 -> h uses zero-gradient (dh/dx=0) instead of radiation
+                nudging_mode, h_ext, u_ext, v_ext, alpha_in  # [OBC - Orlanski - 2D - Nuding] inflow scheme + external (recorded) col-b data; [OBC - Orlanski - 2D - IndepRx] 
                 ):  # Updated the last column of input for Orlanski [OBC - Orlanski]
     """JIT-compiled, multi-threaded time step. Modifies u, v, h in place; state
     arrays have shape (nk, nj, ni). The work is organized as fused loops that
@@ -283,14 +322,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     
     # [OBC - Orlanski]
     if obc_on == 1:
-        if h_zerograd == 1:
-            # zero-gradient h: open-boundary column copies its inland neighbour b-1 (dh/dx = 0)
-            for k in range(nk):
-                for j in range(nj):
-                    h[k, j, b_obc] = h[k, j, b_obc - 1]
-        else:
-            _orlanski_east(h, h_prev, b_obc, rx_h,
-                           nudging_mode, h_ext, alpha_in)  # [OBC - Orlanski - 2D - IndepRx] h estimates its own rx; +nudging args
+        _orlanski_east(h, h_prev, b_obc, rx_h,
+                       nudging_mode, h_ext, alpha_in)  # [OBC - Orlanski - 2D - IndepRx] h estimates its own rx; +nudging args
 
     # Interface positions eta (cumulative from bottom) and Montgomery potential
     # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
@@ -1155,7 +1188,7 @@ class SSWEM:
     def run_obc(self, dt, samp, nsampes, prev_cols,
                 h_bc_all, u_bc_all, v_bc_all, b_obc,
                 nudging=False, h_ext_all=None, u_ext_all=None, v_ext_all=None,
-                alpha_in=0.5, h_bc='radiate'):  # [OBC - Orlanski - 2D - Nuding] inflow scheme selector + external col-b data; [OBC - Orlanski - 2D - IndepRx] dropped uv_from_h
+                alpha_in=0.5):  # [OBC - Orlanski - 2D - Nuding] inflow scheme selector + external col-b data; [OBC - Orlanski - 2D - IndepRx] dropped uv_from_h
         """West: prescribe (replace) `prev_cols` from stored data each step (the existing  # [OBC-E]
         sponge-edge band). East: 1D Orlanski radiation at column `b_obc`, computed only    # [OBC-E]
         from interior columns b-1,b-2 (interior-determined; periodicity kept).             # [OBC-E]
@@ -1180,7 +1213,6 @@ class SSWEM:
         b = int(b_obc)
         nudging_mode = int(bool(nudging))  # [OBC - Orlanski - 2D - Nuding] 0=prescribe, 1=inflow nudging
         alpha_in = float(alpha_in)         # [OBC - Orlanski - 2D - Nuding]
-        h_zerograd = int(h_bc == 'zerograd')   # h OBC mode: 'radiate' (default) or 'zerograd' (dh/dx=0, paper Table 1)
 
         nsteps = nsampes * samp
         # Check if the shape of the stored boundary data matches the expected shape based on nsteps and bc_cols.
@@ -1256,8 +1288,7 @@ class SSWEM:
                             h_prev = h_prev, u_prev = u_prev, v_prev = v_prev,
                             rx_h = rx_h, rx_u = rx_u, rx_v = rx_v,
                             nudging_mode = nudging_mode, h_ext = h_ext_s,  # [OBC - Orlanski - 2D - Nuding]
-                            u_ext = u_ext_s, v_ext = v_ext_s, alpha_in = alpha_in,  # [OBC - Orlanski - 2D - Nuding]
-                            h_zerograd = h_zerograd)
+                            u_ext = u_ext_s, v_ext = v_ext_s, alpha_in = alpha_in)  # [OBC - Orlanski - 2D - Nuding]
             rxh[it-1] = rx_h; rxu[it-1] = rx_u; rxv[it-1] = rx_v  # [OBC - Orlanski] store phase speeds for diag
 
             if np.any(np.isnan(self.u)):
@@ -1283,7 +1314,105 @@ class SSWEM:
                 f"u={rx['u_mean'].mean():.3f}  v={rx['v_mean'].mean():.3f}")
             
         return u, v, h, time, diffs, rx
+
+    #  Like run_obc, but the east phase speed (cx, cy) comes from `phase_fn`
+    #  (a torch network) instead of the analytic estimate. The OBC is LIFTED out
+    #  of the @njit step: the interior is advanced with obc_on=0, then column b is
+    #  overwritten in numpy (torch cannot run inside numba nopython).
+    def run_obc_nn(self, dt, samp, nsampes, prev_cols,
+                   h_bc_all, u_bc_all, v_bc_all, b_obc,
+                   h_ext_all, u_ext_all, v_ext_all,
+                   phase_fn=None, nudging=True, alpha_in=0.99):   # 
+        """
+            samp : steps between stored output frames
+            phi_bc_all : per_step stored Western prescribed value
+            phi_ext_all : external forcing at open boundary
+            phase_fn : The Neural Network
         
+        """
+        
+        prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())   # 
+        b = int(b_obc)                                                                     # 
+        alpha_eff = float(alpha_in) if nudging else 1.0                                    #  False -> hard prescribe
+        nsteps = nsampes * samp                                                             
+        if h_bc_all.shape[0] < nsteps:                                                      
+            raise ValueError(f" stored west data has {h_bc_all.shape[0]} < nsteps={nsteps}")   
+
+        def _prep_ext(a, name):                                                            
+            a = np.asarray(a, dtype=np.float64)                                             
+            if a.ndim == 4 and a.shape[-1] == 1:                                            
+                a = a[..., 0]                                                              
+            if a.ndim != 3 or a.shape[1:] != (self.nk, self.nj):                            
+                raise ValueError(f" {name} must be (>=nsteps,nk,nj[,1]); got {a.shape}")   
+            if a.shape[0] < nsteps:                                                        
+                raise ValueError(f" {name} has {a.shape[0]} < nsteps={nsteps}")     
+            return np.ascontiguousarray(a)                                                
+        h_ext_all = _prep_ext(h_ext_all, "h_ext_all")                                       
+        u_ext_all = _prep_ext(u_ext_all, "u_ext_all")                                       
+        v_ext_all = _prep_ext(v_ext_all, "v_ext_all")                                       
+
+        if not (2 <= b < self.ni - 1):                                                      
+            raise ValueError(f" b_obc={b} needs 2 <= b < ni-1={self.ni-1}")         
+        if np.any((prev_cols >= b - 2) & (prev_cols <= b)):                                 
+            raise ValueError(f" prescribed cols must avoid {{{b-2},{b-1},{b}}}; got {list(prev_cols)}")  
+
+        self._print_run_info(dt, nsteps)                                                   
+        print(f" east phase speed from "                                           
+              f"{'analytic numpy (classical baseline)' if phase_fn is None else 'NEURAL NETWORK'}; "   
+              f"inflow {('NUDGE alpha_in=%.3g' % alpha_eff) if nudging else 'PRESCRIBE (hard)'}")       
+        print("Running (Neural-Network-OBC)...")                                                         
+
+        u = np.zeros((nsampes+1, self.nk, self.nj, self.ni))                                 
+        v = np.zeros((nsampes+1, self.nk, self.nj, self.ni))                                 
+        h = np.zeros((nsampes+1, self.nk, self.nj, self.ni))                                 
+        time = np.zeros((nsampes+1))                                                         
+        u[0] = self.u; v[0] = self.v; h[0] = self.h; time[0] = self.time                     
+
+        h_diff = np.zeros(2); u_diff = np.zeros(2); v_diff = np.zeros(2)                     #west misfit scratch
+
+        jm = lambda A: np.roll(A,  1, axis=-1)   # (.., j-1)                                  
+        jp = lambda A: np.roll(A, -1, axis=-1)   # (.., j+1)                                  
+        def _X8(bm1_n, b_n, bm1_np1, bm2_np1):                                               #  build (nk,nj,8) packed stencil
+            return np.stack([jm(bm1_n), bm1_n, jp(bm1_n),     # 0,1,2 (b-1, j-1/j/j+1) @ n     
+                             jm(b_n),   b_n,   jp(b_n),       # 3,4,5 (b,   j-1/j/j+1) @ n     
+                             bm1_np1, bm2_np1], axis=-1)      # 6,7   pim1, pim2 @ n+1         
+
+        nsamp = 0; nrun = nsteps
+        # The main loop                                                              
+        for it in range(1, nsteps + 1):                                                       
+            # snapshot phi^n at columns b-1, b (all rows j) BEFORE the step                    
+            h_bm1, h_b = self.h[:, :, b-1].copy(), self.h[:, :, b].copy()                      
+            u_bm1, u_b = self.u[:, :, b-1].copy(), self.u[:, :, b].copy()                      
+            v_bm1, v_b = self.v[:, :, b-1].copy(), self.v[:, :, b].copy()                      
+            # advance interior WITHOUT the njit OBC (obc_on=0); west prescribe as run_obc       
+            self._step_core(dt, 2, prev_cols,                                                  
+                            h_bc_all[it-1], u_bc_all[it-1], v_bc_all[it-1],                     
+                            h_diff, u_diff, v_diff, obc_on=0)                                   
+            # post-step: pim1=(b-1)@n+1, pim2=(b-2)@n+1; overwrite col b per field              
+            for fld, bm1_n, b_n, ext_all, fcode in (                                           
+                    (self.h, h_bm1, h_b, h_ext_all, 0),                                        
+                    (self.u, u_bm1, u_b, u_ext_all, 1),                                        
+                    (self.v, v_bm1, v_b, v_ext_all, 2)):                                       
+                X8 = _X8(bm1_n, b_n, fld[:, :, b-1].copy(), fld[:, :, b-2].copy())            #  (nk,nj,8)
+                Xf = X8.reshape(-1, 8)                       # (m,8) flat batch of stencils    # 
+                cx, cy, inflow = _phase_inflow_np(Xf)        # analytic (m,); inflow flag always# 
+                if phase_fn is not None:                                                       # 
+                    cx, cy = phase_fn(Xf, fcode)             # NN overrides (cx, cy), each (m,) # 
+                upd = _obc_update_np(Xf, cx, cy, inflow, ext_all[it-1].reshape(-1), alpha_eff)#  (m,)
+                fld[:, :, b] = upd.reshape(self.nk, self.nj) # overwrite col b                  
+            if np.any(np.isnan(self.u)):                                                        
+                print('Model has blown up!!! Stopping early')                                   
+                u = u[:nsamp]; v = v[:nsamp]; h = h[:nsamp]; time = time[:nsamp]                
+                nrun = it; break                                                               
+            if it % samp == 0:                                                                  
+                nsamp += 1                                                                      
+                u[nsamp] = self.u; v[nsamp] = self.v                                            
+                h[nsamp] = self.h; time[nsamp] = self.time                                      
+        print("...done")                                                                        
+
+        diffs = {'t_step': np.arange(1, nrun+1) * dt, 'h_max': None}                            
+        return u, v, h, time, diffs                                                            #  5-tuple: (u, v, h, time, diffs)
+
     # [OBC] single _step_numba call site, shared by step() (bc_mode=0) and the
     # [OBC] boundary record/replace runs. Advances time/iter after the JIT step.
     def _step_core(self, dt, bc_mode, bc_cols,\
@@ -1293,8 +1422,7 @@ class SSWEM:
                    obc_on = 0, b_obc = 0,
                    h_prev = None, u_prev = None, v_prev = None,
                    rx_h = None, rx_u = None, rx_v = None,
-                   nudging_mode = 0, h_ext = None, u_ext = None, v_ext = None, alpha_in = 0.0,  # [OBC - Orlanski - 2D - Nuding]; [OBC - Orlanski - 2D - IndepRx] dropped rx_field/uv_from_h
-                   h_zerograd = 0):   # 1 -> zero-gradient h at the OBC instead of radiation
+                   nudging_mode = 0, h_ext = None, u_ext = None, v_ext = None, alpha_in = 0.0):  # [OBC - Orlanski - 2D - Nuding]; [OBC - Orlanski - 2D - IndepRx] dropped rx_field/uv_from_h
         # Sponge gates are cached by the h/u/v_relax setters (a bool keeps the
         # JIT argument types stable and lets numba skip a term when its sponge
         # is off), so no per-step recomputation is needed.
@@ -1321,8 +1449,7 @@ class SSWEM:
                     self.hsub, self.iter,
                     bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff, #  [OBC]
                     obc_on, int(b_obc), h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,  # [OBC - Orlanski]
-                    int(nudging_mode), h_ext, u_ext, v_ext, float(alpha_in),  # [OBC - Orlanski - 2D - Nuding]
-                    int(h_zerograd))
+                    int(nudging_mode), h_ext, u_ext, v_ext, float(alpha_in))  # [OBC - Orlanski - 2D - Nuding]
         self.time += dt
         self.iter += 1
 

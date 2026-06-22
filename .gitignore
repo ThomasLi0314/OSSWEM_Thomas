@@ -5,3 +5,6 @@ __pycache__/
 *.gif
 *.md
 *.npz
+
+OBC_Implementation/diagnosis/
+Neural_Net/

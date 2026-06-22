@@ -15,20 +15,20 @@ Two pieces of the original scheme are provided:
         ratio + inflow flag), kept as the baseline to beat, as pretraining
         targets, and for the Phase-1.6 round-trip check.
 
-Packed stencil X has shape (..., 8); columns are RAW physical values:        # [NN-OBC]
-    0: (b-1, j-1) @ n     3: (b, j-1) @ n      6: (b-1, j) @ n+1   = pim1     # [NN-OBC]
-    1: (b-1, j  ) @ n     4: (b, j  ) @ n      7: (b-2, j) @ n+1   = pim2     # [NN-OBC]
-    2: (b-1, j+1) @ n     5: (b, j+1) @ n          (4 = phi_prev_b_j)         # [NN-OBC]
+Packed stencil X has shape (..., 8); columns are RAW physical values:        
+    0: (b-1, j-1) @ n     3: (b, j-1) @ n      6: (b-1, j) @ n+1   = pim1     
+    1: (b-1, j  ) @ n     4: (b, j  ) @ n      7: (b-2, j) @ n+1   = pim2     
+    2: (b-1, j+1) @ n     5: (b, j+1) @ n          (4 = phi_prev_b_j)         
 
 Everything is elementwise + torch.where/clamp, so the functions run on torch
 tensors (with autograd) or on plain numpy via `torch.as_tensor`.
 """
 import torch
 
-# packed-column indices                                                       # [NN-OBC]
-BM1_JM, BM1_J, BM1_JP = 0, 1, 2   # (b-1, j-1/j/j+1) @ n                       # [NN-OBC]
-B_JM,   B_J,   B_JP   = 3, 4, 5   # (b,   j-1/j/j+1) @ n   (B_J = phi_prev_b_j) # [NN-OBC]
-PIM1,   PIM2          = 6, 7      # (b-1,j) , (b-2,j) @ n+1                    # [NN-OBC]
+# packed-column indices                                                       
+BM1_JM, BM1_J, BM1_JP = 0, 1, 2   # (b-1, j-1/j/j+1) @ n                       
+B_JM,   B_J,   B_JP   = 3, 4, 5   # (b,   j-1/j/j+1) @ n   (B_J = phi_prev_b_j) 
+PIM1,   PIM2          = 6, 7      # (b-1,j) , (b-2,j) @ n+1                    
 
 
 def orlanski_east_update(X, cx, cy, inflow=None, phi_ext=None, alpha_in=1.0):
@@ -53,21 +53,21 @@ def orlanski_east_update(X, cx, cy, inflow=None, phi_ext=None, alpha_in=1.0):
     phi_ext  : (...) external (recorded control) value at column b; needed if any inflow
     alpha_in : FIXED scalar nudging coefficient in [0, 1]
     """
-    phi_prev_b_j = X[..., B_J]    # (b, j)   @ n   = phi_prev_b_j               # [NN-OBC]
-    pim1         = X[..., PIM1]   # (b-1, j) @ n+1                              # [NN-OBC]
-    b_jm         = X[..., B_JM]   # (b, j-1) @ n                                # [NN-OBC]
-    b_jp         = X[..., B_JP]   # (b, j+1) @ n                                # [NN-OBC]
+    phi_prev_b_j = X[..., B_J]    # (b, j)   @ n   = phi_prev_b_j               
+    pim1         = X[..., PIM1]   # (b-1, j) @ n+1                              
+    b_jm         = X[..., B_JM]   # (b, j-1) @ n                                
+    b_jp         = X[..., B_JP]   # (b, j+1) @ n                                
 
-    # outflow: 2D Orlanski radiation (upwind tangential diff selected by sign(cy))  # [NN-OBC]
-    dy_b = torch.where(cy >= 0.0, phi_prev_b_j - b_jm, b_jp - phi_prev_b_j)    # [NN-OBC]
-    rad  = (phi_prev_b_j + cx * pim1 - cy * dy_b) / (1.0 + cx)                 # [NN-OBC]
+    # outflow: 2D Orlanski radiation (upwind tangential diff selected by sign(cy))  
+    dy_b = torch.where(cy >= 0.0, phi_prev_b_j - b_jm, b_jp - phi_prev_b_j)    
+    rad  = (phi_prev_b_j + cx * pim1 - cy * dy_b) / (1.0 + cx)                 
 
-    if inflow is None or phi_ext is None:                                     # [NN-OBC]
-        return rad                                                            # [NN-OBC] pure radiation (no inflow handling)
+    if inflow is None or phi_ext is None:                                     
+        return rad                                                      
 
-    # inflow: nudge toward the recorded external column with the FIXED alpha_in  # [NN-OBC]
-    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)                # [NN-OBC]
-    return torch.where(inflow, nudge, rad)                                    # [NN-OBC]
+    # inflow: nudge toward the recorded external column with the FIXED alpha_in  
+    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)                
+    return torch.where(inflow, nudge, rad)                                    
 
 
 def orlanski_east_analytic(X):
@@ -78,22 +78,22 @@ def orlanski_east_analytic(X):
     the scheme on outflow); inflow == (raw cx < 0). Use as the analytic baseline,
     as pretraining targets, or to supply the inflow mask to `orlanski_east_update`.
     """
-    pim1, pim2          = X[..., PIM1], X[..., PIM2]                           # [NN-OBC]
-    bm1_jm, bm1_j, bm1_jp = X[..., BM1_JM], X[..., BM1_J], X[..., BM1_JP]      # [NN-OBC]
+    pim1, pim2          = X[..., PIM1], X[..., PIM2]                           
+    bm1_jm, bm1_j, bm1_jp = X[..., BM1_JM], X[..., BM1_J], X[..., BM1_JP]      
 
-    dphi_t = pim1 - bm1_j        # phi^{n+1}_{b-1} - phi^n_{b-1}               # [NN-OBC]
-    dphi_x = pim1 - pim2         # phi^{n+1}_{b-1} - phi^{n+1}_{b-2}           # [NN-OBC]
-    cen    = bm1_jp - bm1_jm     # central diff in j @ n                       # [NN-OBC]
-    dphi_y = torch.where(dphi_t * cen > 0.0,                                   # [NN-OBC] upwind in j
-                         bm1_j - bm1_jm, bm1_jp - bm1_j)                       # [NN-OBC]
+    dphi_t = pim1 - bm1_j        # phi^{n+1}_{b-1} - phi^n_{b-1}               
+    dphi_x = pim1 - pim2         # phi^{n+1}_{b-1} - phi^{n+1}_{b-2}           
+    cen    = bm1_jp - bm1_jm     # central diff in j @ n                       
+    dphi_y = torch.where(dphi_t * cen > 0.0,                                    # upwind in j
+                         bm1_j - bm1_jm, bm1_jp - bm1_j)                       
 
-    denom = dphi_x * dphi_x + dphi_y * dphi_y          # |grad phi|^2          # [NN-OBC]
-    safe  = denom > 0.0                                                        # [NN-OBC]
-    denom_s = torch.where(safe, denom, torch.ones_like(denom))                 # [NN-OBC] avoid 0-div
-    cx = torch.where(safe, -dphi_t * dphi_x / denom_s, torch.zeros_like(denom))# [NN-OBC]
-    cy = torch.where(safe, -dphi_t * dphi_y / denom_s, torch.zeros_like(denom))# [NN-OBC]
+    denom = dphi_x * dphi_x + dphi_y * dphi_y          # |grad phi|^2          
+    safe  = denom > 0.0                                                        
+    denom_s = torch.where(safe, denom, torch.ones_like(denom))                  # avoid 0-div
+    cx = torch.where(safe, -dphi_t * dphi_x / denom_s, torch.zeros_like(denom))
+    cy = torch.where(safe, -dphi_t * dphi_y / denom_s, torch.zeros_like(denom))
 
-    inflow = cx < 0.0                                  # rx<0 -> inflow        # [NN-OBC]
-    cx = torch.clamp(cx, 0.0, 1.0)                     # inflow->0; outflow->[0,1] # [NN-OBC]
-    cy = torch.clamp(cy, -1.0, 1.0)                                            # [NN-OBC]
+    inflow = cx < 0.0                             
+    cx = torch.clamp(cx, 0.0, 1.0)                     # inflow->0; outflow->[0,1] 
+    cy = torch.clamp(cy, -1.0, 1.0)                                            
     return cx, cy, inflow
