@@ -112,7 +112,7 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
             pim1 = phi[k, j, b_obc-1] #phi^{n+1}_{b-1, j}
             pim2 = phi[k, j, b_obc-2] #phi^{n+1}_{b-2, j}     
 
-            dphi_t = pim1 - phi_prev[k, j, 0]           
+            dphi_t = pim1 - phi_prev[k, j, 0]  # - phi^n_{b-1,j}    
             dphi_x = pim1 - pim2                            
 
             # centeral difference
@@ -132,12 +132,16 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
 
             if rx < 0.0: # inflow
                 rx = 0.0
-                if nudging_mode == 1:   # [OBC - Orlanski - 2D - Nuding]
-                    # phi_b^{n+1} = 
+                if nudging_mode == 1:   
+                    # phi_b^{n+1} = alpha * phi^{ext} + phi_{b,j}^n - \alpha \phi_{b,j}^n
+                    # Here alpha = \Delta t / \tau_in. So when \alpha = 1 it is a hard prescrib. 
                     phi[k, j, b_obc] = phi_prev[k, j, 1] + alpha_in * (phi_ext[k, j] - phi_prev[k, j, 1])
                 else:
                     phi[k, j, b_obc] = phi_ext[k, j]
             else: # Outflow
+                
+                # There bound here is essential for stability, see the notion notes for more information. 
+                # https://app.notion.com/p/Implement-the-2D-Orlanski-Scheme-385ecf1359d480c48a91f31af71911d2?v=45fecf1359d4827e896e884f4f5a3adf&source=copy_link
                 if rx > 3.0: rx = 3.0
                 if ry > 3.0: ry = 3.0     
                 elif ry < -3.0: ry = -3.0                      
@@ -1225,10 +1229,10 @@ class SSWEM:
         time = np.zeros((nsampes+1))
         u[0] = self.u; v[0] = self.v; h[0] = self.h; time[0] = self.time
 
-        # phi_n at {b-2, b-1, b}
-        h_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
-        u_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
-        v_prev = np.zeros((self.nk, self.nj, 2))  # [OBC - Orlanski]
+        # phi_n at [b-1, b]
+        h_prev = np.zeros((self.nk, self.nj, 2))  
+        u_prev = np.zeros((self.nk, self.nj, 2)) 
+        v_prev = np.zeros((self.nk, self.nj, 2))
 
         rx_h = np.zeros(2); rx_u = np.zeros(2); rx_v = np.zeros(2)  # [OBC - Orlanski] phase-speed diags at b-1,b
         h_diff = np.zeros(2); u_diff = np.zeros(2); v_diff = np.zeros(2)  # [OBC - Orlanski] diffs for diagnostics
