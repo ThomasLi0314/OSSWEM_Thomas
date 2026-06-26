@@ -165,36 +165,36 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
 #   6:(b-1,j)@n+1 = pim1        7:(b-2,j)@n+1 = pim2                                               # 
 def _phase_inflow_np(X8):                                                                          # 
     """Analytic per-point (cx, cy) + inflow flag from the packed stencil (numpy). Faithful copy   # 
-    of the estimation branch of _orlanski_east; cx in [0,1], cy in [-1,1], inflow == (raw cx<0)."""# 
-    pim1, pim2            = X8[..., 6], X8[..., 7]                                                 # 
-    bm1_jm, bm1_j, bm1_jp = X8[..., 0], X8[..., 1], X8[..., 2]                                     # 
-    dphi_t = pim1 - bm1_j                                                                          # 
-    dphi_x = pim1 - pim2                                                                           # 
-    cen    = bm1_jp - bm1_jm                                                                       # 
+    of the estimation branch of _orlanski_east; cx in [0,1], cy in [-1,1], inflow == (raw cx<0).""" 
+    pim1, pim2            = X8[..., 6], X8[..., 7]                                                  
+    bm1_jm, bm1_j, bm1_jp = X8[..., 0], X8[..., 1], X8[..., 2]                                      
+    dphi_t = pim1 - bm1_j                                                                           
+    dphi_x = pim1 - pim2                                                                            
+    cen    = bm1_jp - bm1_jm                                                                        
     dphi_y = np.where(dphi_t * cen > 0.0, bm1_j - bm1_jm, bm1_jp - bm1_j)                          #  upwind in j
-    denom  = dphi_x * dphi_x + dphi_y * dphi_y                                                     # 
-    safe   = denom > 0.0                                                                           # 
+    denom  = dphi_x * dphi_x + dphi_y * dphi_y                                                      
+    safe   = denom > 0.0                                                                            
     denom_s = np.where(safe, denom, 1.0)                                                           #  avoid 0-div
-    cx = np.where(safe, -dphi_t * dphi_x / denom_s, 0.0)                                           # 
-    cy = np.where(safe, -dphi_t * dphi_y / denom_s, 0.0)                                           # 
+    cx = np.where(safe, -dphi_t * dphi_x / denom_s, 0.0)                                            
+    cy = np.where(safe, -dphi_t * dphi_y / denom_s, 0.0)                                            
     inflow = cx < 0.0                                                                              #  rx<0 -> inflow
-    cx = np.clip(cx, 0.0, 1.0)                                                                     # 
-    cy = np.clip(cy, -1.0, 1.0)                                                                    # 
-    return cx, cy, inflow                                                                          # 
+    cx = np.clip(cx, 0.0, 1.0)                                                                      
+    cy = np.clip(cy, -1.0, 1.0)                                                                     
+    return cx, cy, inflow                                                                           
 
 
-def _obc_update_np(X8, cx, cy, inflow, phi_ext, alpha_in):                                         # 
-    """East-Orlanski boundary update (numpy), faithful to _orlanski_east.                          # 
-    OUTFLOW: phi_b = (phi_prev_b + cx*pim1 - cy*dy_b)/(1+cx).                                       # 
-    INFLOW : phi_b = phi_prev_b + alpha_in*(phi_ext - phi_prev_b)  (cx,cy unused; alpha_in=1 == hard prescribe)."""  # 
-    phi_prev_b_j = X8[..., 4]    # (b, j)   @ n                                                    # 
-    pim1         = X8[..., 6]    # (b-1, j) @ n+1                                                  # 
-    b_jm         = X8[..., 3]    # (b, j-1) @ n                                                    # 
-    b_jp         = X8[..., 5]    # (b, j+1) @ n                                                    # 
-    dy_b = np.where(cy >= 0.0, phi_prev_b_j - b_jm, b_jp - phi_prev_b_j)                           # 
-    rad  = (phi_prev_b_j + cx * pim1 - cy * dy_b) / (1.0 + cx)                                     # 
-    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)                                     # 
-    return np.where(inflow, nudge, rad)                                                            # 
+def _obc_update_np(X8, cx, cy, inflow, phi_ext, alpha_in):                                          
+    """East-Orlanski boundary update (numpy), faithful to _orlanski_east.                           
+    OUTFLOW: phi_b = (phi_prev_b + cx*pim1 - cy*dy_b)/(1+cx).                                       
+    INFLOW : phi_b = phi_prev_b + alpha_in*(phi_ext - phi_prev_b)  (cx,cy unused; alpha_in=1 == hard prescribe)."""   
+    phi_prev_b_j = X8[..., 4]    # (b, j)   @ n                                                     
+    pim1         = X8[..., 6]    # (b-1, j) @ n+1                                                   
+    b_jm         = X8[..., 3]    # (b, j-1) @ n                                                     
+    b_jp         = X8[..., 5]    # (b, j+1) @ n                                                     
+    dy_b = np.where(cy >= 0.0, phi_prev_b_j - b_jm, b_jp - phi_prev_b_j)                            
+    rad  = (phi_prev_b_j + cx * pim1 - cy * dy_b) / (1.0 + cx)                                      
+    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)                                      
+    return np.where(inflow, nudge, rad)                                                             
 
 
 @njit(parallel=True, cache=True)

@@ -70,6 +70,55 @@ def orlanski_east_update(X, cx, cy, inflow=None, phi_ext=None, alpha_in=1.0):
     return torch.where(inflow, nudge, rad)                                    
 
 
+def orlanski_east_update_1d(X, cx, inflow=None, phi_ext=None, alpha_in=1.0):  # [OBC-1D]
+    """1D east-Orlanski boundary update: the 2D update with the tangential cy term dropped.  # [OBC-1D]
+
+    OUTFLOW (inflow False): 1D Orlanski radiation with the network's cx (no cy):  # [OBC-1D]
+        phi_b = (phi_prev_b_j + cx*pim1) / (1 + cx)  # [OBC-1D]
+    INFLOW (inflow True): same fixed-alpha_in nudge as the 2D scheme; cx unused.  # [OBC-1D]
+        phi_b = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)  # [OBC-1D]
+
+    X        : (..., 8) raw physical stencil (torch tensor)  # [OBC-1D]
+    cx       : (...) network phase speed; used on OUTFLOW points only  # [OBC-1D]
+    inflow   : (...) bool mask. None -> treat every point as outflow (pure radiation)  # [OBC-1D]
+    phi_ext  : (...) external (recorded control) value at column b; needed if any inflow  # [OBC-1D]
+    alpha_in : FIXED scalar nudging coefficient in [0, 1]  # [OBC-1D]
+    """
+    phi_prev_b_j = X[..., B_J]    # (b, j)   @ n   = phi_prev_b_j  # [OBC-1D]
+    pim1         = X[..., PIM1]   # (b-1, j) @ n+1                 # [OBC-1D]
+
+    rad = (phi_prev_b_j + cx * pim1) / (1.0 + cx)   # [OBC-1D] 1D radiation (no cy*dy term)
+
+    if inflow is None or phi_ext is None:           # [OBC-1D]
+        return rad                                  # [OBC-1D]
+
+    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)  # [OBC-1D]
+    return torch.where(inflow, nudge, rad)          # [OBC-1D]
+
+
+def orlanski_east_analytic_1d(X):  # [OBC-1D]
+    """Analytic per-point 1D phase speed cx + inflow flag from the stencil.  # [OBC-1D]
+
+    1D reduction of `orlanski_east_analytic`: |grad phi|^2 -> dphi_x^2, so  # [OBC-1D]
+    cx = -dphi_t/dphi_x. Returns (cx, inflow): cx in [0,1] (same clip on outflow);  # [OBC-1D]
+    inflow == (raw cx < 0).  # [OBC-1D]
+    """
+    pim1, pim2 = X[..., PIM1], X[..., PIM2]   # [OBC-1D]
+    bm1_j      = X[..., BM1_J]                # [OBC-1D]
+
+    dphi_t = pim1 - bm1_j        # phi^{n+1}_{b-1} - phi^n_{b-1}      # [OBC-1D]
+    dphi_x = pim1 - pim2         # phi^{n+1}_{b-1} - phi^{n+1}_{b-2}  # [OBC-1D]
+
+    denom   = dphi_x * dphi_x                                          # [OBC-1D] |grad phi|^2 in 1D
+    safe    = denom > 0.0                                              # [OBC-1D]
+    denom_s = torch.where(safe, denom, torch.ones_like(denom))        # [OBC-1D] avoid 0-div
+    cx = torch.where(safe, -dphi_t * dphi_x / denom_s, torch.zeros_like(denom))  # [OBC-1D]
+
+    inflow = cx < 0.0                                                  # [OBC-1D]
+    cx = torch.clamp(cx, 0.0, 1.0)                # inflow->0; outflow->[0,1]  # [OBC-1D]
+    return cx, inflow                                                 # [OBC-1D]
+
+
 def orlanski_east_analytic(X):
     """Analytic per-point phase speed (cx, cy) + inflow flag from the stencil.
 
