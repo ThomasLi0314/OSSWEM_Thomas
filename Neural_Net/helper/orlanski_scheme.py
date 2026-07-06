@@ -139,10 +139,10 @@ def orlanski_east_analytic(X):
     denom = dphi_x * dphi_x + dphi_y * dphi_y          # |grad phi|^2          
     safe  = denom > 0.0                                                        
     denom_s = torch.where(safe, denom, torch.ones_like(denom))                  # avoid 0-div
-    cx = torch.where(safe, -dphi_t * dphi_x / denom_s, torch.zeros_like(denom))
-    cy = torch.where(safe, -dphi_t * dphi_y / denom_s, torch.zeros_like(denom))
+    rx = torch.where(safe, -dphi_t * dphi_x / denom_s, torch.zeros_like(denom))
+    ry = torch.where(safe, -dphi_t * dphi_y / denom_s, torch.zeros_like(denom))
 
-    inflow = cx < 0.0                             
-    cx = torch.clamp(cx, 0.0, 1.0)                     # inflow->0; outflow->[0,1] 
-    cy = torch.clamp(cy, -1.0, 1.0)                                            
-    return cx, cy, inflow
+    inflow = rx < 0.0                             
+    # cx = torch.clamp(cx, 0.0, 1.0)                     # inflow->0; outflow->[0,1] 
+    # cy = torch.clamp(cy, -1.0, 1.0)                                            
+    return rx, ry, inflow
