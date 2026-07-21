@@ -84,20 +84,25 @@ def _nb_vxuy(u, v, rdx, rdy):
 @njit(cache=True)
 def _orlanski_east(phi, phi_prev, b_obc, rx_out,
                    nudging_mode, phi_ext, alpha_in,
-                   rxy_out,                                # [OBC - 2D - PhaseDiag] +rxy_out (nk,nj,2)
-                   inflow_persistent):                    # [PERSIST] 1 -> clamp rx>=0 (inflow becomes persistence, no nudge)
+                   rxy_out,                                
+                   inflow_persistent,                    
+                   ry_on):                               
     """
         b here is the column for implementing the orlanski.
 
-          0 -> PRESCRIBE scheme: on inflow HARD-prescribe column b to the     # [OBC - Orlanski - 2D - Prescribe]
+          0 -> PRESCRIBE scheme: on inflow HARD-prescribe column b to the     
                recorded external solution, phi_b^{n+1} = phi_ext
           1 -> NUDGING scheme: on inflow SOFT-prescribe column b toward the recorded external solution phi_ext,                         
                  phi_b^{n+1} = phi_b^n + alpha_in*(phi_ext - phi_b^n),       
             This is the paper's adaptive scheme (alpha_in=1 == hard prescribe).   
         phi_ext : (nk, nj) external (recorded) value of THIS field at column
-               b for the current step; read on inflow in BOTH modes.           # [OBC - Orlanski - 2D - Prescribe]
+               b for the current step; read on inflow in BOTH modes.         
         alpha_in : inflow nudging coefficient in (0,1]; only used if nudging. 
         Outflow is ALWAYS pure radiation in both modes (no nudge applied).  
+        ry_on : 1 -> full 2D scheme.  0 -> 1D Orlanski limit: the tangential      
+               difference is dropped from BOTH the phase-speed denominator and    
+               the update, so r_x collapses to the classic -phi_t/phi_x and       
+               r_y == 0.  
 
         Input
         phi_prev = phi[k, all j, b-1:b] here k for layer
@@ -124,21 +129,23 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
             else:
                 dphi_y = phi_prev[k, jp, 0] - phi_prev[k, j, 0] # phi_{b-1, j+1} - phi_{b-1, j}
 
-            denom = dphi_x*dphi_x + dphi_y*dphi_y # THis is the norm of gradient
+            if ry_on == 1:                                      
+                denom = dphi_x*dphi_x + dphi_y*dphi_y # THis is the norm of gradient
+            else:                                               
+                denom = dphi_x*dphi_x                           
 
             eps_denom = 1e-3                                        
             r_d = (1.0 / eps_denom) if denom < eps_denom else (1.0 / denom) 
             rx = -dphi_t * dphi_x * r_d                             
-            ry = -dphi_t * dphi_y * r_d  
+            ry = -dphi_t * dphi_y * r_d if ry_on == 1 else 0.0  
 
             if inflow_persistent : 
                 if rx < 0.0:
                     rx = 0.0
                     ry = 0.0                           
 
-            if rx < 0.0: # inflow
-                # rx = 0.0
-                # ry = 0.0   # [OBC - 2D - PhaseDiag] inflow is prescribed/nudged, not radiated -> record (rx,ry)=(0,0)
+            # inflow    
+            if rx < 0.0:
                 if nudging_mode == 1:
                     # phi_b^{n+1} = alpha * phi^{ext} + phi_{b,j}^n - \alpha \phi_{b,j}^n
                     # Here alpha = \Delta t / \tau_in. So when \alpha = 1 it is a hard prescrib. 
@@ -147,18 +154,12 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out,
                 else:
                     phi[k, j, b_obc] = phi_ext[k, j]
                     phi[k, j, b_obc + 1] = phi[k,j, b_obc]
-            else: # Outflow
+            else: 
+                if rx > 1 / 50: rx = 1 / 50
+                if ry > 1 / 50: ry = 1 / 50 
+                elif ry < -1 / 50: ry = -1 / 50              
                 
-                # There bound here is essential for stability, see the notion notes for more information. 
-                # https://app.notion.com/p/Implement-the-2D-Orlanski-Scheme-385ecf1359d480c48a91f31af71911d2?v=45fecf1359d4827e896e884f4f5a3adf&source=copy_link
-                if rx > 8 / 50: rx = 8 / 50
-                if ry > 8 / 50: ry = 8 / 50 
-                elif ry < -8 / 50: ry = -8 / 50
 
-                # if rx > 3: rx = 3
-                # if ry > 3: ry = 3  
-                # elif ry < -3: ry = -3                
-       # [OBC - Orlanski - 2D - IndepRx]
                 if ry >= 0.0:
                     dy_b = phi_prev[k, j, 1] - phi_prev[k, jm, 1] # phi^n_{b,j} - \phi_{b, j-1}
                 else:  
@@ -185,11 +186,12 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 h_relax_on, u_relax_on, v_relax_on, hsub, iter_num,
                 bc_mode, bc_cols, h_bc, u_bc, v_bc, h_diff, u_diff, v_diff,
                 obc_on, b_obc, h_prev, u_prev, v_prev, rx_h, rx_u, rx_v,
-                rxy_h, rxy_u, rxy_v,                          # [OBC - 2D - PhaseDiag] per-row (nk,nj,2) applied (rx,ry) for h,u,v
-                nudging_mode, h_ext, u_ext, v_ext, alpha_in,  # [OBC - Orlanski - 2D - Nuding] inflow scheme + external (recorded) col-b data; [OBC - Orlanski - 2D - IndepRx]
-                h_zerograd,                                   # 1 -> h uses zero-gradient (dh/dx=0) instead of radiation
-                inflow_persistent                             # [PERSIST] 1 -> clamp rx>=0 (inflow becomes persistence, no nudge)
-                ):  # Updated the last column of input for Orlanski [OBC - Orlanski]
+                rxy_h, rxy_u, rxy_v,                         
+                nudging_mode, h_ext, u_ext, v_ext, alpha_in,  
+                h_zerograd,                                  
+                inflow_persistent,                          
+                ry_on                                         
+                ):  
     """JIT-compiled, multi-threaded time step. Modifies u, v, h in place; state
     arrays have shape (nk, nj, ni). The work is organized as fused loops that
     recompute stencil quantities inline rather than building full-grid
@@ -280,17 +282,16 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                         hv_jp = 0.0 if j == nj - 1 else hv[k,j+1,i]   # [NP] north wall: zero meridional flux (was periodic wrap)
                         h[k,j,i] -= cy * ( hv_jp - hv[k,j,i] )
 
-    # [OBC] block A: record/replace h at the prescribed boundary columns (bc_cols,
-    # [OBC] any length), done AFTER continuity (h^{n+1}) but BEFORE the momentum step
-    # [OBC] reads h, so a replaced h feeds the subsequent (u,v) solve. Serial range
-    # [OBC] loops only (no prange): matches the file's rule that reductions stay explicit.
-    n_bc = bc_cols.shape[0]                                   # [OBC] number of columns
-    if bc_mode == 1:                                          # [OBC] record
+    # bc_mode == 1 is storing the boundary, this is for control run
+    n_bc = bc_cols.shape[0]                                   # number of columns
+    if bc_mode == 1:                                          # record
         for k in range(nk):
             for j in range(nj):
                 for c in range(n_bc):
                     h_bc[k,j,c] = h[k,j,bc_cols[c]]
-    elif bc_mode == 2:                                        # [OBC] compare + replace
+    # bc_mode == 2 is for comparision (only used for testing), in this mode, the western sponge layer columns
+    # are replaced by the corresponding stored values. 
+    elif bc_mode == 2:                                        
         maxd = 0.0
         ss = 0.0
         for k in range(nk):
@@ -303,18 +304,18 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
         h_diff[0] = maxd
         h_diff[1] = ( ss / ( nk*nj*n_bc ) )**0.5
     
-    # [OBC - Orlanski]
+    # [OBC] Orlanski boundary condition (only when obc_on is on)
     if obc_on == 1:
         if h_zerograd == 1:
-            # zero-gradient h: open-boundary column copies its inland neighbour b-1 (dh/dx = 0)
             for k in range(nk):
                 for j in range(nj):
                     h[k, j, b_obc] = h[k, j, b_obc - 1]
         else:
             _orlanski_east(h, h_prev, b_obc, rx_h,
                            nudging_mode, h_ext, alpha_in,
-                           rxy_h,  #[OBC - 2D - PhaseDiag] +per-row rxy_h
-                           inflow_persistent)  # [PERSIST]
+                           rxy_h,  
+                           inflow_persistent,  
+                           ry_on) 
 
     # Interface positions eta (cumulative from bottom) and Montgomery potential
     # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
@@ -363,11 +364,10 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 im = i - 1 if i > 0 else ni - 1
                 ip = i + 1 if i < ni - 1 else 0
                 at_n = ( j == nj - 1 )                   # [NP] north wall row -> v=0, hv=0 across the north face
-                v_jp_i   = 0.0 if at_n else v[k,j+1,i]   # [NP]
-                v_jp_im  = 0.0 if at_n else v[k,j+1,im]  # [NP]
-                hv_jp_i  = 0.0 if at_n else hv[k,j+1,i]  # [NP]
-                hv_jp_im = 0.0 if at_n else hv[k,j+1,im] # [NP]
-
+                v_jp_i   = 0.0 if at_n else v[k,j+1,i]   
+                v_jp_im  = 0.0 if at_n else v[k,j+1,im]  
+                hv_jp_i  = 0.0 if at_n else hv[k,j+1,i]  
+                hv_jp_im = 0.0 if at_n else hv[k,j+1,im] 
                 # Masked PV at q-points (j,i), (jp,i), (j,ip):
                 #   q = (f + vx - uy) ; q *= r ; q *= (hqp*r),  r = 1/(hqp+hsub)
                 vort_c  = f[j, i]  + ( v[k,j,i]  - v[k,j,im]  ) * rdx - ( u[k,j,i]  - u[k,jm,i]  ) * rdy
@@ -392,12 +392,6 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                             + qpv_jp * 0.5 * ( hv_jp_i + hv_jp_im ) )   # [NP] zero flux on north wall
                 qhu = 0.5 * ( qpv_c  * 0.5 * ( hu[k,j,i]  + hu[k,jm,i]  )
                             + qpv_ip * 0.5 * ( hu[k,j,ip] + hu[k,jm,ip] ) )
-            
-    
-                # qhv = 0.5 * ( vort_c * 0.5 * ( v[k,j,i]  + v[k,j,im]  )
-                #             + vort_jp * 0.5 * ( v[k,jp,i] + v[k,jp,im] ) )
-                # qhu = 0.5 * ( vort_c  * 0.5 * ( u[k,j,i]  + u[k,jm,i]  )
-                #             + vort_ip * 0.5 * ( u[k,j,ip] + u[k,jm,ip] ) )
 
                 # Stress tensor: nu_h*h*D_tension at h-points {(j,i),(j,im),(jm,i)};
                 # nu_h*hq*D_shear at q-points {(j,i),(jp,i),(j,ip)}.
@@ -453,7 +447,6 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                     Lv -= abv * v[k+1,j,i]
                 udot[k,j,i] -= Lu * rhu[k,j,i]
                 vdot[k,j,i] -= Lv * rhv[k,j,i]
-                    ##########################
     if obc_on == 1: 
         udot[:, :, b_obc] = udot[:, :, b_obc - 1]
 
@@ -564,11 +557,13 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
         _orlanski_east(u, u_prev, b_obc, rx_u,
                        nudging_mode, u_ext, alpha_in,
                        rxy_u,  # [OBC - Orlanski - 2D - Nuding] +nudging args; [OBC - 2D - PhaseDiag] +per-row rxy_u
-                       inflow_persistent)  # [PERSIST]
+                       inflow_persistent,  # [PERSIST]
+                       ry_on)  # [RY1D]
         _orlanski_east(v, v_prev, b_obc, rx_v,
                        nudging_mode, v_ext, alpha_in,
                        rxy_v,  # [OBC - Orlanski - 2D - Nuding] +nudging args; [OBC - 2D - PhaseDiag] +per-row rxy_v
-                       inflow_persistent)  # [PERSIST]
+                       inflow_persistent,  # [PERSIST]
+                       ry_on)  # [RY1D]
 
     # --- restoring (backward Euler) ---
     # Applied after the dynamics, so each field relaxes implicitly toward its
@@ -1024,10 +1019,7 @@ class SSWEM:
         print("Time: Trun * fo =", Trun * self.fo)
         print("Time: Trun * ( cg / L ) =", Trun * self.cg / self.Lx)
 
-    # [OBC] Like run(), but records (u,v,h) at the two prescribed boundary columns
-    # [OBC] EVERY step: h at the end-of-continuity phase, (u,v) at the end-of-solve
-    # [OBC] phase (both pre-restoring; see blocks A/B in _step_numba). These stores
-    # [OBC] are what run_replace_bc later injects to drive an identical second run.
+    # Records (u,v,h) control run
     def run_record_bc(self, dt, samp, nsamps, bc_cols,
                       store_downstream=False, probe_i0=None, n_probe=1):
         """
@@ -1128,11 +1120,7 @@ class SSWEM:
                       'h': h_probe_all, 'u': u_probe_all, 'v': v_probe_all }
         return u, v, h, time, h_bc_all, u_bc_all, v_bc_all, probe
 
-    # [OBC] Like run(), but at EVERY step compares the freely-evolved boundary
-    # [OBC] columns against the stored data and overwrites them: h right after
-    # [OBC] continuity, (u,v) right after the implicit solve (see blocks A/B).
-    # [OBC] With the sponge active and stored data from the same IC, the diffs
-    # [OBC] should be ~0 (the overwrite is a no-op) -> identical dynamics.
+    # Replace the western sponge layers and compare it before replacing (for testing). 
     def run_replace_bc(self, dt, samp, nsamps, bc_cols, h_bc_all, u_bc_all, v_bc_all):
         """
         dt, samp, nsamps - as run().
@@ -1196,13 +1184,14 @@ class SSWEM:
               f"|du|={diffs['u_max'].max():.3e}  |dv|={diffs['v_max'].max():.3e}")
         return u, v, h, time, diffs
 
-    # [OBC - Orlanski] New Driver for OBC with Orlanski
+    # [OBC - Orlanski] OBC run 
     def run_obc(self, dt, samp, nsampes, prev_cols,
                 h_bc_all, u_bc_all, v_bc_all, b_obc,
                 nudging=False, h_ext_all=None, u_ext_all=None, v_ext_all=None,
-                alpha_in=0.5, h_bc='radiate',  # [OBC - Orlanski - 2D - Nuding] inflow scheme selector + external col-b data; [OBC - Orlanski - 2D - IndepRx] dropped uv_from_h
-                store_downstream=False, probe_i0=None, n_probe=1,  # [OBC - 2D - Probe] optional per-step probe (mirrors run_record_bc)
-                inflow_persistent=False):  # [PERSIST] True -> clamp rx>=0 so inflow rows persist (phi_b^{n+1}=phi_b^n) instead of reading phi_ext
+                alpha_in=0.5, h_bc='radiate', 
+                store_downstream=False, probe_i0=None, n_probe=1, 
+                inflow_persistent=False,  # [PERSIST] True -> clamp rx>=0 so inflow rows persist (phi_b^{n+1}=phi_b^n) instead of reading phi_ext
+                ry_2d=True):  # [RY1D] True -> 2D Orlanski; False -> 1D Orlanski (ry == 0), everything else identical
         """West: prescribe (replace) `prev_cols` from stored data each step (the existing  # [OBC-E]
         sponge-edge band). East: 1D Orlanski radiation at column `b_obc`, computed only    # [OBC-E]
         from interior columns b-1,b-2 (interior-determined; periodicity kept).             # [OBC-E]
@@ -1223,13 +1212,13 @@ class SSWEM:
             probe at probe_i0=b_obc). REQUIRED when nudging=True, ignored otherwise.    
         alpha_in : inflow nudging coefficient in (0,1]; 1 == hard prescribe.
 
-        store_downstream : if True, ALSO store (u,v,h) EVERY STEP at a block of        # [OBC - 2D - Probe]
-            columns (post-step state, same convention as run_record_bc's probe).       # [OBC - 2D - Probe]
-            E.g. probe_i0=b_obc-1, n_probe=1 gives step-cadence data at b-1 for        # [OBC - 2D - Probe]
-            theory-vs-r_x boundary diagnostics. Returned as rx['probe'] (a dict with   # [OBC - 2D - Probe]
-            'cols', 'x_km', 'h'/'u'/'v', each (nrun,nk,nj,n_probe); None when off),    # [OBC - 2D - Probe]
-            so the 6-value return signature is unchanged.                              # [OBC - 2D - Probe]
-        probe_i0, n_probe : start column index and number of contiguous columns.       # [OBC - 2D - Probe]
+        store_downstream : if True, ALSO store (u,v,h) EVERY STEP at a block of        
+            columns (post-step state, same convention as run_record_bc's probe).       
+            E.g. probe_i0=b_obc-1, n_probe=1 gives step-cadence data at b-1 for        
+            theory-vs-r_x boundary diagnostics. Returned as rx['probe'] (a dict with   
+            'cols', 'x_km', 'h'/'u'/'v', each (nrun,nk,nj,n_probe); None when off),    
+            so the 6-value return signature is unchanged.                              
+        probe_i0, n_probe : start column index and number of contiguous columns.       
         """
         prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())
         b = int(b_obc)
@@ -1237,16 +1226,13 @@ class SSWEM:
         alpha_in = float(alpha_in)         # [OBC - Orlanski - 2D - Nuding]
         h_zerograd = int(h_bc == 'zerograd')   # h OBC mode: 'radiate' (default) or 'zerograd' (dh/dx=0, paper Table 1)
         inflow_persistent_mode = int(bool(inflow_persistent))  # [PERSIST] 0=inflow uses phi_ext (prescribe/nudge), 1=inflow persists
+        ry_on = int(bool(ry_2d))  # [RY1D] 0 -> tangential term dropped from denominator AND update -> 1D Orlanski
 
         nsteps = nsampes * samp
         # Check if the shape of the stored boundary data matches the expected shape based on nsteps and bc_cols.
         if h_bc_all.shape[0] < nsteps:
             raise ValueError(f"[OBC-E] stored west data has {h_bc_all.shape[0]} < nsteps={nsteps}")  # [OBC-E]
 
-
-        # [OBC - Orlanski - 2D - PrescribeFix] ext col-b data is read on inflow in BOTH
-        # modes (hard-prescribe when nudging=False, soft when True), so it is ALWAYS required.
-        # Check if the exterior value is prepaerd
         if h_ext_all is None or u_ext_all is None or v_ext_all is None:
             raise ValueError("[OBC - Orlanski - 2D - Nuding] run_obc needs h_ext_all/u_ext_all/"
                              "v_ext_all (recorded col-b external data, e.g. run_record_bc probe "
@@ -1267,19 +1253,19 @@ class SSWEM:
         u_ext_all = _prep_ext(u_ext_all, "u_ext_all")
         v_ext_all = _prep_ext(v_ext_all, "v_ext_all")
 
-        # [OBC - 2D - Probe] optional per-step probe setup (validate + allocate only when enabled)
-        if store_downstream:                                                           # [OBC - 2D - Probe]
-            if probe_i0 is None:                                                       # [OBC - 2D - Probe]
-                raise ValueError("[OBC - 2D - Probe] store_downstream=True requires "  # [OBC - 2D - Probe]
-                                 "probe_i0 (start column index)")                      # [OBC - 2D - Probe]
-            probe_i0 = int(probe_i0); n_probe = int(n_probe)                           # [OBC - 2D - Probe]
-            if n_probe < 1 or probe_i0 < 0 or probe_i0 + n_probe > self.ni:            # [OBC - 2D - Probe]
-                raise ValueError(f"[OBC - 2D - Probe] probe columns [{probe_i0}, "     # [OBC - 2D - Probe]
-                                 f"{probe_i0 + n_probe}) out of range [0, {self.ni})") # [OBC - 2D - Probe]
-            sl_probe = slice(probe_i0, probe_i0 + n_probe)                             # [OBC - 2D - Probe]
-            h_probe_all = np.zeros((nsteps, self.nk, self.nj, n_probe))                # [OBC - 2D - Probe]
-            u_probe_all = np.zeros((nsteps, self.nk, self.nj, n_probe))                # [OBC - 2D - Probe]
-            v_probe_all = np.zeros((nsteps, self.nk, self.nj, n_probe))                # [OBC - 2D - Probe]
+        # optional per-step probe setup (validate + allocate only when enabled)
+        if store_downstream:                                                           
+            if probe_i0 is None:                                                       
+                raise ValueError("[OBC - 2D - Probe] store_downstream=True requires "  
+                                 "probe_i0 (start column index)")                      
+            probe_i0 = int(probe_i0); n_probe = int(n_probe)                           
+            if n_probe < 1 or probe_i0 < 0 or probe_i0 + n_probe > self.ni:            
+                raise ValueError(f"[OBC - 2D - Probe] probe columns [{probe_i0}, "     
+                                 f"{probe_i0 + n_probe}) out of range [0, {self.ni})") 
+            sl_probe = slice(probe_i0, probe_i0 + n_probe)                             
+            h_probe_all = np.zeros((nsteps, self.nk, self.nj, n_probe))                
+            u_probe_all = np.zeros((nsteps, self.nk, self.nj, n_probe))                
+            v_probe_all = np.zeros((nsteps, self.nk, self.nj, n_probe))                
 
         # Check if the location of the Western open boundary lies in the interior
         if not (2 <= b < self.ni - 1):
@@ -1303,11 +1289,12 @@ class SSWEM:
         rx_h = np.zeros(2); rx_u = np.zeros(2); rx_v = np.zeros(2)  # [OBC - Orlanski] phase-speed diags at b-1,b
         h_diff = np.zeros(2); u_diff = np.zeros(2); v_diff = np.zeros(2)  # [OBC - Orlanski] diffs for diagnostics
         rxh = np.zeros((nsteps, 2)); rxu = np.zeros((nsteps, 2)); rxv = np.zeros((nsteps, 2))  # [OBC - Orlanski] phase speeds for diagnostics
-        # [OBC - 2D - PhaseDiag] per-row, per-step APPLIED (rx,ry) for each field: (nsteps,nk,nj,2). [...,0]=rx, [...,1]=ry
+        # per-row, per-step APPLIED (rx,ry) for each field: (nsteps,nk,nj,2). [...,0]=rx, [...,1]=ry
         rxy_h_row = np.zeros((nsteps, self.nk, self.nj, 2))
         rxy_u_row = np.zeros((nsteps, self.nk, self.nj, 2))
         rxy_v_row = np.zeros((nsteps, self.nk, self.nj, 2))
         print("[OBC - Orlanski - 2D - IndepRx] east r_x estimated independently per field (h, u, v)")  # [OBC - Orlanski - 2D - IndepRx]
+        print(f"[RY1D] east OBC scheme: {'2D Orlanski (r_y active)' if ry_on else '1D Orlanski (r_y = 0)'}")  # [RY1D]
         print(f"[OBC - Orlanski - 2D - Nuding] east inflow scheme: "  # [OBC - Orlanski - 2D - Nuding]
               f"{f'NUDGING (alpha_in={alpha_in:.3g}, ghost wall removed)' if nudging_mode else 'PRESCRIBE (hard-set col b = external)'}")  # [OBC - Orlanski - 2D - Prescribe]
 
@@ -1319,7 +1306,7 @@ class SSWEM:
             u_prev[:] = self.u[:, :, b-1:b+1] 
             v_prev[:] = self.v[:, :, b-1:b+1]
 
-            # [OBC - Orlanski - 2D - PrescribeFix] external col-b slice; read on inflow in BOTH modes
+            # external col-b slice; read on inflow in BOTH modes
             h_ext_s = h_ext_all[it - 1]; u_ext_s = u_ext_all[it - 1]; v_ext_s = v_ext_all[it - 1]
             # advance
             # To turn off prescribing, set the second argument to 0.
@@ -1333,12 +1320,13 @@ class SSWEM:
                             nudging_mode = nudging_mode, h_ext = h_ext_s,  # [OBC - Orlanski - 2D - Nuding]
                             u_ext = u_ext_s, v_ext = v_ext_s, alpha_in = alpha_in,  # [OBC - Orlanski - 2D - Nuding]
                             h_zerograd = h_zerograd,
-                            inflow_persistent = inflow_persistent_mode)  # [PERSIST]
+                            inflow_persistent = inflow_persistent_mode,  # [PERSIST]
+                            ry_on = ry_on)  # [RY1D]
             rxh[it-1] = rx_h; rxu[it-1] = rx_u; rxv[it-1] = rx_v  # [OBC - Orlanski] store phase speeds for diag
-            if store_downstream:                                  # [OBC - 2D - Probe] post-step state (same convention as run_record_bc)
-                h_probe_all[it-1] = self.h[:, :, sl_probe]        # [OBC - 2D - Probe]
-                u_probe_all[it-1] = self.u[:, :, sl_probe]        # [OBC - 2D - Probe]
-                v_probe_all[it-1] = self.v[:, :, sl_probe]        # [OBC - 2D - Probe]
+            if store_downstream:                                  # post-step state (same convention as run_record_bc)
+                h_probe_all[it-1] = self.h[:, :, sl_probe]        
+                u_probe_all[it-1] = self.u[:, :, sl_probe]        
+                v_probe_all[it-1] = self.v[:, :, sl_probe]        
 
             if np.any(np.isnan(self.u)):
                 print('Model has blown up!!! Stopping early')
@@ -1359,26 +1347,23 @@ class SSWEM:
                 'h_mean': rxh[:nrun, 0], 'hmax': rxh[:nrun, 1],
                 'u_mean': rxu[:nrun, 0], 'umax': rxu[:nrun, 1],
                 'v_mean': rxv[:nrun, 0], 'vmax': rxv[:nrun, 1],
-                # [OBC - 2D - PhaseDiag] per-row APPLIED phase-speed Courant numbers, each (nrun,nk,nj).
-                # Convert to phase speed [m/s]: c_x = rx*dx/dt, c_y = ry*dy/dt.
+                # per-row APPLIED phase-speed Courant numbers, each (nrun,nk,nj).
                 'rx_h_row': rxy_h_row[:nrun, :, :, 0], 'ry_h_row': rxy_h_row[:nrun, :, :, 1],
                 'rx_u_row': rxy_u_row[:nrun, :, :, 0], 'ry_u_row': rxy_u_row[:nrun, :, :, 1],
                 'rx_v_row': rxy_v_row[:nrun, :, :, 0], 'ry_v_row': rxy_v_row[:nrun, :, :, 1]}
-        # [OBC - 2D - Probe] bundle the optional per-step probe into rx (return signature unchanged)
-        probe = None                                                                   # [OBC - 2D - Probe]
-        if store_downstream:                                                           # [OBC - 2D - Probe]
-            probe = { 'cols': np.arange(probe_i0, probe_i0 + n_probe),                 # [OBC - 2D - Probe]
-                      'x_km': self.xh1[probe_i0:probe_i0 + n_probe] / 1e3,             # [OBC - 2D - Probe]
-                      'h': h_probe_all[:nrun], 'u': u_probe_all[:nrun],                # [OBC - 2D - Probe]
-                      'v': v_probe_all[:nrun] }                                        # [OBC - 2D - Probe]
-        rx['probe'] = probe                                                            # [OBC - 2D - Probe]
+        # bundle the optional per-step probe into rx (return signature unchanged)
+        probe = None                                                                   
+        if store_downstream:                                                           
+            probe = { 'cols': np.arange(probe_i0, probe_i0 + n_probe),                 
+                      'x_km': self.xh1[probe_i0:probe_i0 + n_probe] / 1e3,             
+                      'h': h_probe_all[:nrun], 'u': u_probe_all[:nrun],                
+                      'v': v_probe_all[:nrun] }                                        
+        rx['probe'] = probe                                                            
         print(f"Mean r_x over run is h = {rx['h_mean'].mean():.3f}"
                 f"u={rx['u_mean'].mean():.3f}  v={rx['v_mean'].mean():.3f}")
             
         return u, v, h, time, diffs, rx
         
-    # [OBC] single _step_numba call site, shared by step() (bc_mode=0) and the
-    # [OBC] boundary record/replace runs. Advances time/iter after the JIT step.
     def _step_core(self, dt, bc_mode, bc_cols,\
                    # [OBC] setting
                    h_bc, u_bc, v_bc, h_diff, u_diff, v_diff,
@@ -1389,23 +1374,22 @@ class SSWEM:
                    rxy_h = None, rxy_u = None, rxy_v = None,  # [OBC - 2D - PhaseDiag] per-row (nk,nj,2) applied (rx,ry) out
                    nudging_mode = 0, h_ext = None, u_ext = None, v_ext = None, alpha_in = 0.0,  # [OBC - Orlanski - 2D - Nuding]; [OBC - Orlanski - 2D - IndepRx] dropped rx_field/uv_from_h
                    h_zerograd = 0,   # 1 -> zero-gradient h at the OBC instead of radiation
-                   inflow_persistent = 0):  # [PERSIST] 1 -> clamp rx>=0 (inflow becomes persistence, no nudge)
+                   inflow_persistent = 0,  # [PERSIST] 1 -> clamp rx>=0 (inflow becomes persistence, no nudge)
+                   ry_on = 1):  # [RY1D] 1 -> 2D Orlanski; 0 -> 1D Orlanski (ry == 0)
         # Sponge gates are cached by the h/u/v_relax setters (a bool keeps the
         # JIT argument types stable and lets numba skip a term when its sponge
         # is off), so no per-step recomputation is needed.
 
-        # [OBC - Orlanski]
         if h_prev is None : h_prev = self._obc_prev_dummy
         if u_prev is None : u_prev = self._obc_prev_dummy
         if v_prev is None : v_prev = self._obc_prev_dummy
         if rx_h is None : rx_h = self._diff_dummy
         if rx_u is None : rx_u = self._diff_dummy
         if rx_v is None : rx_v = self._diff_dummy
-        # [OBC - 2D - PhaseDiag] per-row (rx,ry) recording arrays default to the shared scratch
         if rxy_h is None : rxy_h = self._obc_rxy_dummy
         if rxy_u is None : rxy_u = self._obc_rxy_dummy
         if rxy_v is None : rxy_v = self._obc_rxy_dummy
-        # [OBC - Orlanski - 2D - Nuding] external col-b data (read on inflow; nudging_mode==1 soft, ==0 hard-prescribe)
+        # external col-b data (read on inflow; nudging_mode==1 soft, ==0 hard-prescribe)
         if h_ext is None : h_ext = self._obc_ext_dummy
         if u_ext is None : u_ext = self._obc_ext_dummy
         if v_ext is None : v_ext = self._obc_ext_dummy
@@ -1423,7 +1407,8 @@ class SSWEM:
                     rxy_h, rxy_u, rxy_v,  # [OBC - 2D - PhaseDiag] per-row (rx,ry) recording arrays
                     int(nudging_mode), h_ext, u_ext, v_ext, float(alpha_in),  # [OBC - Orlanski - 2D - Nuding]
                     int(h_zerograd),
-                    int(inflow_persistent))  # [PERSIST]
+                    int(inflow_persistent),  # [PERSIST]
+                    int(ry_on))  # [RY1D]
         self.time += dt
         self.iter += 1
 
@@ -1431,8 +1416,6 @@ class SSWEM:
         """
         dt   - Time step [s]
         """
-        # [OBC] bc_mode=0 + cached dummies -> the boundary blocks are skipped, so
-        # [OBC] this is bit-identical to the pre-OBC step.
         self._step_core(dt, 0, self._bc_cols_dummy,
                         self._bc_dummy, self._bc_dummy, self._bc_dummy,
                         self._diff_dummy, self._diff_dummy, self._diff_dummy)
