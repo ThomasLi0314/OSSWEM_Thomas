@@ -105,10 +105,10 @@ def _orlanski_east(phi, phi_prev, b_obc, rx_out, phi_ext):
             # Have question, how to handle the case, why?
             if rx < 0.0:
                 rx = 0.0
-                phi[k, j, b_obc] = phi_ext[k, j]
+                phi[k, j, b_obc] = phi_ext[k, j] # Hard prescribe
             else:
-                if rx > 1.0:
-                    rx = 1.0
+                # if rx > 1.0:
+                #     rx = 1.0
                 phi[k,j,b_obc] = (phi_prev[k,j,1] + rx * pim1) / (1.0 + rx)
 
             sumr += rx
@@ -378,6 +378,9 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                     Lv -= abv * v[k+1,j,i]
                 udot[k,j,i] -= Lu * rhu[k,j,i]
                 vdot[k,j,i] -= Lv * rhv[k,j,i]
+
+    if obc_on == 1:
+        udot[:, :, b_obc] = udot[:, :, b_obc - 1]
 
     # --- implicit TDMAH2 (cancellation-free; recurrence identical to reference,
     # done per column with scalar locals) ---

@@ -58,16 +58,21 @@ def orlanski_east_update(X, cx, cy, inflow=None, phi_ext=None, alpha_in=1.0):
     b_jm         = X[..., B_JM]   # (b, j-1) @ n                                
     b_jp         = X[..., B_JP]   # (b, j+1) @ n                                
 
-    # outflow: 2D Orlanski radiation (upwind tangential diff selected by sign(cy))  
-    dy_b = torch.where(cy >= 0.0, phi_prev_b_j - b_jm, b_jp - phi_prev_b_j)    
-    rad  = (phi_prev_b_j + cx * pim1 - cy * dy_b) / (1.0 + cx)                 
+    def _radiate(cx_, cy_, phi_, pim1_, b_jm_, b_jp_):  
+        dy_b = torch.where(cy_ >= 0.0, phi_ - b_jm_, b_jp_ - phi_)
+        return (phi_ + cx_ * pim1_ - cy_ * dy_b) / (1.0 + cx_)                
 
-    if inflow is None or phi_ext is None:                                     
-        return rad                                                      
+    # if inflow is None or phi_ext is None:   
+    # Outflow
+    if inflow is None:                                   
+        return _radiate(cx, cy, phi_prev_b_j, pim1, b_jm, b_jp)
+                                                      
 
     # inflow: nudge toward the recorded external column with the FIXED alpha_in  
-    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)                
-    return torch.where(inflow, nudge, rad)                                    
+    out = ~inflow
+    nudge = phi_prev_b_j + alpha_in * (phi_ext - phi_prev_b_j)   # no cx,cy dependence -> safe everywhere
+    rad_out = _radiate(cx[out], cy[out], phi_prev_b_j[out], pim1[out], b_jm[out], b_jp[out])
+    return nudge.masked_scatter(out, rad_out)                                  
 
 
 def orlanski_east_update_1d(X, cx, inflow=None, phi_ext=None, alpha_in=1.0):  # [OBC-1D]

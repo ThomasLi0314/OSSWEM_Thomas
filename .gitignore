@@ -10,3 +10,5 @@ __pycache__/
 
 OBC_Implementation/diagnosis/
 Neural_Net/
+# Exceeds GitHub 100MB file size limit
+2D_orlanski/No-periodicity-NS-2-layer-baroclinic-jet.ipynb
