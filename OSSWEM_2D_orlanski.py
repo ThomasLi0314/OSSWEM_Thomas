@@ -1208,7 +1208,7 @@ class SSWEM:
                   the ghost wall is removed (pass prev_cols WITHOUT b+1).
         h_ext_all, u_ext_all, v_ext_all : per-step external (recorded) col-b data,       
             shape (>=nsteps, nk, nj) or (>=nsteps, nk, nj, 1) (e.g. a run_record_bc     
-            probe at probe_i0=b_obc). REQUIRED when nudging=True, ignored otherwise.    
+            probe at probe_i0=b_obc). REQUIRED for external forcing when inflow.    
         alpha_in : inflow nudging coefficient in (0,1]; 1 == hard prescribe.
 
         store_downstream : if True, ALSO store (u,v,h) EVERY STEP at a block of        

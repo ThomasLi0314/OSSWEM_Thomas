@@ -788,6 +788,8 @@ class SSWEM:
         self._obc_ext_dummy = np.zeros((self.nk, self.nj))
         # [OBC - 2D - PhaseDiag] (nk,nj,2) scratch for per-row (rx,ry) when no recording array is supplied
         self._obc_rxy_dummy = np.zeros((self.nk, self.nj, 2))
+        # [CL] per-step centre-line store; stays None until a run is called with store_center=True
+        self.center_line = None
 
 
         # Derived parameters
@@ -1070,12 +1072,65 @@ class SSWEM:
         print("Time: Trun * fo =", Trun * self.fo)
         print("Time: Trun * ( cg / L ) =", Trun * self.cg / self.Lx)
 
-    # [OBC] Like run(), but records (u,v,h) at the two prescribed boundary columns
-    # [OBC] EVERY step: h at the end-of-continuity phase, (u,v) at the end-of-solve
-    # [OBC] phase (both pre-restoring; see blocks A/B in _step_numba). These stores
-    # [OBC] are what run_replace_bc later injects to drive an identical second run.
+    # [CL] record center-line
+    def _center_init(self, store_center, center_j, center_stride, center_fields,
+                     nsteps, center_i0=0, center_i1=None, i1_default=None):
+        """Allocate the per-step centre-row store on self.center_line.
+        Columns are restricted to [center_i0, center_i1) -- interior only; the OBC
+        drivers pass i1_default = b_obc + 1 so nothing east of the boundary is kept."""
+        if not store_center:
+            self.center_line = None
+            return False, 0, 1, (), slice(0, 0)                              
+        j = self.nj // 2 if center_j is None else int(center_j)               #nj//2 = y ~ Ly/2
+        if not (0 <= j < self.nj):
+            raise ValueError(f"[CL-REC] center_j={j} out of range [0,{self.nj})")
+        i0 = int(center_i0)                                                  
+        i1 = int(center_i1) if center_i1 is not None else \
+             int(i1_default if i1_default is not None else self.ni)           #default = up to & incl. the OBC col
+        if not (0 <= i0 < i1 <= self.ni):
+            raise ValueError(f"[CL-REC] column range [{i0},{i1}) invalid for ni={self.ni}")
+        sl     = slice(i0, i1)                                               
+        n_cl   = i1 - i0                                                     
+        stride = max(1, int(center_stride))
+        fields = tuple(f for f in ('h', 'u', 'v') if f in tuple(center_fields))
+        nrec   = nsteps // stride
+        self.center_line = {f: np.zeros((nrec, self.nk, n_cl), dtype=np.float32)
+                            for f in fields}                                  #float32 halves RAM
+        self.center_line.update(j=j, i0=i0, i1=i1, cols=np.arange(i0, i1),
+                                stride=stride, x_km=self.xh1[sl] / 1e3,
+                                y_km=float(self.yh1[j]) / 1e3,
+                                step=(np.arange(nrec) + 1) * stride,
+                                t=np.zeros(nrec))                            
+        print(f"[CL-REC] centre line: row j={j} (y={self.center_line['y_km']:.0f} km), "
+              f"cols i={i0}..{i1-1} ({n_cl} of {self.ni}, interior of the OBC), "
+              f"stride={stride} -> {nrec} records, fields={fields}")          
+        return True, j, stride, fields, sl                                   
+
+    def _center_store(self, on, it, j, stride, fields, sl):
+        """Copy row j (interior columns only) of the post-step state."""
+        if not on or (it % stride):
+            return                                                           
+        n = it // stride - 1                                                 
+        src = {'h': self.h, 'u': self.u, 'v': self.v}                        
+        for f in fields:
+            self.center_line[f][n] = src[f][:, j, sl]                         #interior slice
+        self.center_line['t'][n] = self.time                                 
+
+    def _center_trim(self, on, nvalid, stride):
+        """Truncate to the records written before an early (blow-up) exit."""
+        if not on:
+            return                                                           
+        n = nvalid // stride                                                 
+        for k in ('h', 'u', 'v', 't', 'step'):
+            if k in self.center_line:
+                self.center_line[k] = self.center_line[k][:n]                
+
+    # Same as run but store the open boundary column (control run)
     def run_record_bc(self, dt, samp, nsamps, bc_cols,
-                      store_downstream=False, probe_i0=None, n_probe=1):
+                      store_downstream=False, probe_i0=None, n_probe=1,
+                      store_center=False, center_j=None, center_stride=1,   # [CL]
+                      center_fields=('h', 'u', 'v'),                        # [CL]
+                      center_i0=0, center_i1=None):                         # [CL] interior column window
         """
         dt      - Time step [s]
         samp    - Steps between samples [steps]
@@ -1099,12 +1154,23 @@ class SSWEM:
         'x_km', and 'h'/'u'/'v' (each (nsteps, nk, nj, n_probe)). The probe is read
         from the post-step state; downstream of the sponge the restoring is zero
         there, so that equals the pre-restoring phase used for the boundary stores.
+
+        [CL] Optional per-step centre line (off by default): store_center=True keeps
+        row `center_j` (default nj//2, i.e. y ~ Ly/2) at EVERY step, over columns
+        [center_i0, center_i1). The control run has no OBC, so center_i1=None falls
+        back to the full ni -- pass center_i1 = b_obc + 1 to keep only the points
+        before the open boundary. Result lands on `self.center_line` (not returned).
         """
         bc_cols = np.ascontiguousarray(np.asarray(bc_cols, dtype=np.int64).ravel())  # [OBC] any length
         n_bc = bc_cols.size
         if n_bc < 1 or bc_cols.min() < 0 or bc_cols.max() >= self.ni:
             raise ValueError(f"[OBC] bc_cols {list(bc_cols)} out of range [0, {self.ni})")
         nsteps = nsamps * samp
+
+        # [CL] centre-line setup; no OBC in the control run -> caller supplies center_i1
+        _c_on, _c_j, _c_st, _c_f, _c_sl = self._center_init(
+            store_center, center_j, center_stride, center_fields, nsteps,
+            center_i0, center_i1)
 
         # [OBC] downstream-probe setup (validate + allocate only when enabled)
         if store_downstream:
@@ -1159,7 +1225,9 @@ class SSWEM:
                     h_probe_all = h_probe_all[:iter-1]
                     u_probe_all = u_probe_all[:iter-1]
                     v_probe_all = v_probe_all[:iter-1]
+                self._center_trim(_c_on, iter - 1, _c_st)     # [CL] drop blown step
                 break
+            self._center_store(_c_on, iter, _c_j, _c_st, _c_f, _c_sl)   # [CL] post-step centre row
             if iter % samp == 0:
                 nsamp += 1
                 u[nsamp] = self.u; v[nsamp] = self.v
@@ -1247,7 +1315,10 @@ class SSWEM:
                 h_bc_all, u_bc_all, v_bc_all, b_obc,
                 nudging=False, h_ext_all=None, u_ext_all=None, v_ext_all=None,
                 alpha_in=0.5, h_bc='radiate',  # [OBC - Orlanski - 2D - Nuding] inflow scheme selector + external col-b data; [OBC - Orlanski - 2D - IndepRx] dropped uv_from_h
-                inflow_persist=False):  # [PERSIST] on inflow, clamp rx>=0 -> persistence (previous-step value), no nudge/prescribe
+                inflow_persist=False,  # [PERSIST] on inflow, clamp rx>=0 -> persistence (previous-step value), no nudge/prescribe
+                store_center=False, center_j=None, center_stride=1,   # [CL]
+                center_fields=('h', 'u', 'v'),                        # [CL]
+                center_i0=0, center_i1=None):                         # [CL] None -> b_obc+1 (interior of the OBC)
         """West: prescribe (replace) `prev_cols` from stored data each step (the existing  # [OBC-E]
         sponge-edge band). East: 1D Orlanski radiation at column `b_obc`, computed only    # [OBC-E]
         from interior columns b-1,b-2 (interior-determined; periodicity kept).             # [OBC-E]
@@ -1266,7 +1337,11 @@ class SSWEM:
         h_ext_all, u_ext_all, v_ext_all : per-step external (recorded) col-b data,       
             shape (>=nsteps, nk, nj) or (>=nsteps, nk, nj, 1) (e.g. a run_record_bc     
             probe at probe_i0=b_obc). REQUIRED when nudging=True, ignored otherwise.    
-        alpha_in : inflow nudging coefficient in (0,1]; 1 == hard prescribe.            
+        alpha_in : inflow nudging coefficient in (0,1]; 1 == hard prescribe.
+
+        [CL] store_center=True keeps row `center_j` (default nj//2) at EVERY step over
+        columns [center_i0, center_i1); center_i1=None -> b_obc+1, so only the points
+        before the open boundary are kept. Result on `self.center_line` (not returned).
         """
         prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())
         b = int(b_obc)
@@ -1317,8 +1392,13 @@ class SSWEM:
         time = np.zeros((nsampes+1))
         u[0] = self.u; v[0] = self.v; h[0] = self.h; time[0] = self.time
 
+        # [CL] centre-line setup; default cut = up to and including the OBC column b
+        _c_on, _c_j, _c_st, _c_f, _c_sl = self._center_init(
+            store_center, center_j, center_stride, center_fields, nsteps,
+            center_i0, center_i1, i1_default=b + 1)
+
         # phi_n at [b-1, b]
-        h_prev = np.zeros((self.nk, self.nj, 2))  
+        h_prev = np.zeros((self.nk, self.nj, 2))
         u_prev = np.zeros((self.nk, self.nj, 2)) 
         v_prev = np.zeros((self.nk, self.nj, 2))
 
@@ -1362,7 +1442,9 @@ class SSWEM:
                 print('Model has blown up!!! Stopping early')
                 u = u[:nsamp]; v = v[:nsamp]; h = h[:nsamp]; time = time[:nsamp]
                 nrun = it  # [OBC-E] steps attempted
+                self._center_trim(_c_on, it - 1, _c_st)      # [CL] drop blown step
                 break
+            self._center_store(_c_on, it, _c_j, _c_st, _c_f, _c_sl)   # [CL] post-step centre row
             if it % samp == 0:
                 nsamp += 1
                 u[nsamp] = self.u; v[nsamp] = self.v
@@ -1398,12 +1480,19 @@ class SSWEM:
                    phase_fn=None, nudging=True, alpha_in=1,
                    nn_field_codes=(0,),   # [MF] field codes that receive the NN; (0,)=h-only (back-compat), (0,1,2)=all fields
                    nn_inflow_corr=False,   # [INCORR] if True, phase_fn returns (rx,ry,dphi_in) and dphi_in is added to the inflow nudge (config 3.2)
-                   nn_outflow_corr=False):   # [ANCH] if True (anchored_corr), phase_fn returns (rx,ry,dphi_out); dphi_out is added to the OUTFLOW radiate. Gate is whatever rx-sign phase_fn encodes.
+                   nn_outflow_corr=False,   # [ANCH] if True (anchored_corr), phase_fn returns (rx,ry,dphi_out); dphi_out is added to the OUTFLOW radiate. Gate is whatever rx-sign phase_fn encodes.
+                   store_center=False, center_j=None, center_stride=1,   # [CL]
+                   center_fields=('h', 'u', 'v'),                        # [CL]
+                   center_i0=0, center_i1=None):                         # [CL] None -> b_obc+1 (interior of the OBC)
         """
             samp : steps between stored output frames
             phi_bc_all : per_step stored Western prescribed value
             phi_ext_all : external forcing at open boundary
             phase_fn : The Neural Network
+
+            [CL] store_center=True keeps row `center_j` (default nj//2) at EVERY step
+            over columns [center_i0, center_i1); center_i1=None -> b_obc+1, so the
+            exterior copy at b+1 is excluded. Result on `self.center_line`.
         """
         prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())
         b = int(b_obc)
@@ -1442,6 +1531,11 @@ class SSWEM:
         h = np.zeros((nsampes+1, self.nk, self.nj, self.ni))
         time = np.zeros((nsampes+1))
         u[0] = self.u; v[0] = self.v; h[0] = self.h; time[0] = self.time
+
+        # [CL] centre-line setup; default cut = up to and including the OBC column b
+        _c_on, _c_j, _c_st, _c_f, _c_sl = self._center_init(
+            store_center, center_j, center_stride, center_fields, nsteps,
+            center_i0, center_i1, i1_default=b + 1)
 
         h_diff = np.zeros(2); u_diff = np.zeros(2); v_diff = np.zeros(2)   # west misfit scratch
 
@@ -1506,7 +1600,9 @@ class SSWEM:
             if np.any(np.isnan(self.u)):
                 print('Model has blown up!!! Stopping early')
                 u = u[:nsamp]; v = v[:nsamp]; h = h[:nsamp]; time = time[:nsamp]
+                self._center_trim(_c_on, it - 1, _c_st)      # [CL] drop blown step
                 nrun = it; break
+            self._center_store(_c_on, it, _c_j, _c_st, _c_f, _c_sl)   # [CL] post-step centre row
             if it % samp == 0:
                 nsamp += 1
                 u[nsamp] = self.u; v[nsamp] = self.v
