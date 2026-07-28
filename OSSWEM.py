@@ -83,7 +83,8 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 dt, dx, dy, g, epsilon, nu_h, nu_v, alpha_f, alpha_nu,
                 h_zonal_target, h_target, u_target, v_target,
                 h_zonal_relax, h_relax, u_relax, v_relax,
-                h_relax_on, u_relax_on, v_relax_on, hsub, iter_num):
+                h_relax_on, u_relax_on, v_relax_on, hsub, iter_num,
+                y_periodic):                                                    # [NP]
     """JIT-compiled, multi-threaded time step. Modifies u, v, h in place; state
     arrays have shape (nk, nj, ni). The work is organized as fused loops that
     recompute stencil quantities inline rather than building full-grid
@@ -112,7 +113,16 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     symmetrize the tridiagonal + Coriolis system and bundle Coriolis as
     h_k(1+ic); every denominator is a sum of nonnegative-real plus
     positive-real-part-complex terms, so it stays robust as h_k -> 0.
-    Re(delta_w) gives delta_u; Im(delta_w) gives delta_v."""
+    Re(delta_w) gives delta_u; Im(delta_w) gives delta_v.
+
+    y_periodic  [NP] True -> the j-direction is periodic,
+    False -> free-slip solid walls at y=0 and y=Ly (a zonal channel). The wall
+    treatment has two distinct parts, because v lives on the *southern* face of
+    each h-cell: (a) the h/u/f family uses a mirrored ghost row (jm/jp clamped
+    rather than wrapped), giving zero normal gradient across the wall; (b) the
+    v family (v, hv, vdot) is *zeroed* on the north face via the mask wn -- the
+    north wall is the phantom v-row j=nj, which the periodic code aliases to
+    row 0. """
     nk, nj, ni = u.shape
     rdx = 1 / dx
     rdy = 1 / dy
@@ -122,7 +132,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     hq_pre = np.empty((nk, nj, ni))
     for k in range(nk):
         for j in prange(nj):
-            jm = j - 1 if j > 0 else nj - 1
+            jm = j - 1 if j > 0 else ( nj - 1 if y_periodic else 0 )            # [NP]
             for i in range(ni):
                 im = i - 1 if i > 0 else ni - 1
                 hq_pre[k,j,i] = 0.5 * ( 0.5 * ( h[k,j,i]  + h[k,j,im]  )
@@ -156,7 +166,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
             # j-direction: hv = v_pos*h[j-1] + v_neg*h[j]; h -= cy*(hv[j+1]-hv[j]).
             for k in range(nk):
                 for j in prange(nj):
-                    jm = j - 1 if j > 0 else nj - 1
+                    jm = j - 1 if j > 0 else ( nj - 1 if y_periodic else 0 )    # [NP] wall: hv[0] uses v[0]=0 -> zero flux through south wall
                     for i in range(ni):
                         vi = v[k,j,i]
                         vp = vi if vi > 0.0 else 0.0
@@ -164,9 +174,10 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                         hv[k,j,i] = vp * h[k,jm,i] + vn * h[k,j,i]
             for k in range(nk):
                 for j in prange(nj):
-                    jp = j + 1 if j < nj - 1 else 0
+                    jp = j + 1 if j < nj - 1 else ( 0 if y_periodic else nj - 1 )   # [NP]
+                    wn = 1.0 if ( y_periodic or j < nj - 1 ) else 0.0               # [NP] north wall: zero meridional flux, vn = 0
                     for i in range(ni):
-                        h[k,j,i] -= cy * ( hv[k,jp,i] - hv[k,j,i] )
+                        h[k,j,i] -= cy * ( wn * hv[k,jp,i] - hv[k,j,i] )             # [NP]
 
     # Interface positions eta (cumulative from bottom) and Montgomery potential
     # M (cumulative from top); cheap k-recursive arrays, kept as in reference.
@@ -189,15 +200,16 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     rhv = np.empty((nk, nj, ni))
     for k in range(nk):
         for j in prange(nj):
-            jm = j - 1 if j > 0 else nj - 1
-            jp = j + 1 if j < nj - 1 else 0
+            jm = j - 1 if j > 0 else ( nj - 1 if y_periodic else 0 )            # [NP] mirror ghost row (was periodic)
+            jp = j + 1 if j < nj - 1 else ( 0 if y_periodic else nj - 1 )       # [NP]
+            wn = 1.0 if ( y_periodic or j < nj - 1 ) else 0.0                   # [NP] v = 0 on north wall
             for i in range(ni):
                 im = i - 1 if i > 0 else ni - 1
                 ip = i + 1 if i < ni - 1 else 0
                 ui = u[k,j,i];   up    = ui  if ui  > 0.0 else 0.0
                 uip = u[k,j,ip]; un_ip = uip if uip < 0.0 else 0.0
                 vi = v[k,j,i];   vp    = vi  if vi  > 0.0 else 0.0
-                vjp = v[k,jp,i]; vn_jp = vjp if vjp < 0.0 else 0.0
+                vjp = wn * v[k,jp,i]; vn_jp = vjp if vjp < 0.0 else 0.0         # [NP]
                 kin = 0.5 * ( up*up + un_ip*un_ip ) + 0.5 * ( vp*vp + vn_jp*vn_jp )
                 B[k,j,i] = M[k,j,i] + kin
                 hau = 0.5 * ( h[k,j,i] + h[k,j,im] )
@@ -210,18 +222,23 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     vdot = np.empty((nk, nj, ni))
     for k in range(nk):
         for j in prange(nj):
-            jm = j - 1 if j > 0 else nj - 1
-            jp = j + 1 if j < nj - 1 else 0
+            jm = j - 1 if j > 0 else ( nj - 1 if y_periodic else 0 )            # [NP] mirror ghost for h/u/f (was periodic)
+            jp = j + 1 if j < nj - 1 else ( 0 if y_periodic else nj - 1 )       # [NP] mirror ghost; the v family uses the wn-masked locals below
+            wn = 1.0 if ( y_periodic or j < nj - 1 ) else 0.0                   # [NP] north wall -> v = 0, hv = 0 across the north face
             for i in range(ni):
                 im = i - 1 if i > 0 else ni - 1
                 ip = i + 1 if i < ni - 1 else 0
+                v_jp_i   = wn * v[k,jp,i]                                       # [NP]
+                v_jp_im  = wn * v[k,jp,im]                                      # [NP]
+                hv_jp_i  = wn * hv[k,jp,i]                                      # [NP]
+                hv_jp_im = wn * hv[k,jp,im]                                     # [NP]
 
                 # Masked PV at q-points (j,i), (jp,i), (j,ip):
                 #   q = (f + vx - uy) ; q *= r ; q *= (hqp*r),  r = 1/(hqp+hsub)
                 vort_c  = f[j, i]  + ( v[k,j,i]  - v[k,j,im]  ) * rdx - ( u[k,j,i]  - u[k,jm,i]  ) * rdy
                 r_c     = 1.0 / ( hq_pre[k,j,i] + hsub )
                 qpv_c   = ( vort_c * r_c ) * ( hq_pre[k,j,i] * r_c )
-                vort_jp = f[jp, i] + ( v[k,jp,i] - v[k,jp,im] ) * rdx - ( u[k,jp,i] - u[k,j,i]   ) * rdy
+                vort_jp = f[jp, i] + ( v_jp_i - v_jp_im ) * rdx - ( u[k,jp,i] - u[k,j,i]   ) * rdy   # [NP] v = 0 on north wall
                 r_jp    = 1.0 / ( hq_pre[k,jp,i] + hsub )
                 qpv_jp  = ( vort_jp * r_jp ) * ( hq_pre[k,jp,i] * r_jp )
                 vort_ip = f[j, ip] + ( v[k,j,ip] - v[k,j,i]   ) * rdx - ( u[k,j,ip] - u[k,jm,ip] ) * rdy
@@ -234,15 +251,15 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
 
                 # PV Coriolis fluxes (q2u/v2q and q2v/u2q expanded).
                 qhv = 0.5 * ( qpv_c  * 0.5 * ( hv[k,j,i]  + hv[k,j,im]  )
-                            + qpv_jp * 0.5 * ( hv[k,jp,i] + hv[k,jp,im] ) )
+                            + qpv_jp * 0.5 * ( hv_jp_i + hv_jp_im ) )           # [NP] zero flux on north wall
                 qhu = 0.5 * ( qpv_c  * 0.5 * ( hu[k,j,i]  + hu[k,jm,i]  )
                             + qpv_ip * 0.5 * ( hu[k,j,ip] + hu[k,jm,ip] ) )
 
                 # Stress tensor: nu_h*h*D_tension at h-points {(j,i),(j,im),(jm,i)};
                 # nu_h*hq*D_shear at q-points {(j,i),(jp,i),(j,ip)}.
-                Dt_c  = ( u[k,j,ip] - u[k,j,i]  ) * rdx - ( v[k,jp,i] - v[k,j,i]  ) * rdy
+                Dt_c  = ( u[k,j,ip] - u[k,j,i]  ) * rdx - ( v_jp_i - v[k,j,i]  ) * rdy   # [NP] v = 0 on north wall
                 nuhDt_c  = nu_h * h[k,j,i]  * Dt_c
-                Dt_im = ( u[k,j,i]  - u[k,j,im] ) * rdx - ( v[k,jp,im]- v[k,j,im] ) * rdy
+                Dt_im = ( u[k,j,i]  - u[k,j,im] ) * rdx - ( v_jp_im - v[k,j,im] ) * rdy  # [NP]
                 nuhDt_im = nu_h * h[k,j,im] * Dt_im
                 Dt_jm = ( u[k,jm,ip]- u[k,jm,i] ) * rdx - ( v[k,j,i]  - v[k,jm,i] ) * rdy
                 nuhDt_jm = nu_h * h[k,jm,i] * Dt_jm
@@ -250,7 +267,7 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
                 Ds_c  = ( u[k,j,i]  - u[k,jm,i] ) * rdy + ( v[k,j,i]  - v[k,j,im]  ) * rdx
                 hqp_c  = min( min( h[k,j,i],  h[k,j,im]  ), min( h[k,jm,i], h[k,jm,im] ) )
                 nuhqDs_c  = nu_h * hqp_c  * Ds_c
-                Ds_jp = ( u[k,jp,i] - u[k,j,i]  ) * rdy + ( v[k,jp,i] - v[k,jp,im] ) * rdx
+                Ds_jp = ( u[k,jp,i] - u[k,j,i]  ) * rdy + ( v_jp_i - v_jp_im ) * rdx   # [NP] v = 0 on north wall
                 hqp_jp = min( min( h[k,jp,i], h[k,jp,im] ), min( h[k,j,i],  h[k,j,im]  ) )
                 nuhqDs_jp = nu_h * hqp_jp * Ds_jp
                 Ds_ip = ( u[k,j,ip] - u[k,jm,ip]) * rdy + ( v[k,j,ip] - v[k,j,i]   ) * rdx
@@ -300,13 +317,14 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     udot_at_v = np.empty((nk, nj, ni))
     for k in range(nk):
         for j in prange(nj):
-            jm = j - 1 if j > 0 else nj - 1
-            jp = j + 1 if j < nj - 1 else 0
+            jm = j - 1 if j > 0 else ( nj - 1 if y_periodic else 0 )            # [NP] mirror ghost row (was periodic)
+            jp = j + 1 if j < nj - 1 else ( 0 if y_periodic else nj - 1 )       # [NP]
+            wn = 1.0 if ( y_periodic or j < nj - 1 ) else 0.0                   # [NP] v-tendency = 0 on north wall
             for i in range(ni):
                 im = i - 1 if i > 0 else ni - 1
                 ip = i + 1 if i < ni - 1 else 0
                 vdot_at_u[k,j,i] = 0.5 * ( 0.5 * ( vdot[k,j,i]  + vdot[k,j,im]  )
-                                         + 0.5 * ( vdot[k,jp,i] + vdot[k,jp,im] ) )
+                                         + 0.5 * ( wn * vdot[k,jp,i] + wn * vdot[k,jp,im] ) )   # [NP]
                 udot_at_v[k,j,i] = 0.5 * ( 0.5 * ( udot[k,j,i]  + udot[k,jm,i]  )
                                          + 0.5 * ( udot[k,j,ip] + udot[k,jm,ip] ) )
 
@@ -396,13 +414,19 @@ def _step_numba(u, v, h, D, taux, tauy, f, f_at_u, f_at_v,
     if v_relax_on:
         v -= ( dt * v_relax / ( 1.0 + dt * v_relax ) ) * ( v - v_target )
 
+    # [NP] South wall sits on the v-row j=0 (y=0): no normal flow through it.
+    if not y_periodic:
+        for k in range(nk):
+            for i in range(ni):
+                v[k, 0, i] = 0.0
+
 class SSWEM:
     """(S)tacked (S)hallow (W)ater (E)quation (M)odel"""
 
     def __init__(self, ni, g, Ho, Lx, fo, beta, epsilon, nu_h, nu_v=0,
                  h_zonal_relax=0, h_relax=None, u_relax=None, v_relax=None,
                  h_target=None, u_target=None, v_target=None,
-                 hsub=1e-12, nj=None, Ly=None):
+                 hsub=1e-12, nj=None, Ly=None, y_periodic=True):
         """
         ni      - Number of cells in i-direction
         g       - Gravity [m s-2]; scalar (broadcast to length 1) or length-nk
@@ -434,6 +458,12 @@ class SSWEM:
                   nj=ni). If given, cells stay square (dy=dx=Lx/ni) and nj is
                   derived from Ly (snapped to an integer number of cells),
                   giving a rectangular domain (e.g. longer in x than y).
+        y_periodic - Meridional boundary condition. True (default) for the
+                  doubly-periodic domain. False for a zonal channel with
+                  free-slip solid walls at y=0 and y=Ly: no normal flow through
+                  either wall and no wall stress (du/dy = 0). The i-direction
+                  stays periodic either way, so with y_periodic=False the total
+                  mass sum(h) is still conserved exactly.
         """
         self.ni = ni
         self.g = np.atleast_1d(np.asarray(g, dtype=float)).copy()
@@ -449,6 +479,7 @@ class SSWEM:
         self.nu_h = nu_h
         self.nu_v = float(nu_v)
         self.hsub = hsub
+        self.y_periodic = bool(y_periodic) # [NP] False -> free-slip walls at y=0, Ly
         self.alpha_f = 0.5 # Crank-Nicholson for Coriolis
         self.alpha_nu = 1.0 # Euler backward for interfacial stresses (vertical viscosity + bottom drag)
 
@@ -524,8 +555,12 @@ class SSWEM:
 
         # Derived parameters
         self.f = self.fo + self.beta * self.yq # Coriolis is at q-points
-        self.f_at_u = _nb_q2u( self.f ) # Coriolis interpolated to u-points
-        self.f_at_v = _nb_q2v( self.f ) # Coriolis interpolated to v-points
+        # [NP] q2u is a j-average and wraps at j=nj-1, which is wrong against a
+        # [NP] wall; the analytic form is identical in the interior and correct
+        # [NP] on the north row, so use it when the walls are on.
+        self.f_at_u = ( _nb_q2u( self.f ) if self.y_periodic
+                        else self.fo + self.beta * self.yu ) # Coriolis interpolated to u-points
+        self.f_at_v = _nb_q2v( self.f ) # Coriolis interpolated to v-points (q2v is an i-average, no j-periodicity)
         self.cg = np.sqrt( self.g[0] * self.Ho.sum() )
         if not self.fo==0:
             self.Ld = self.cg / self.fo
@@ -790,7 +825,8 @@ class SSWEM:
                     self.h_zonal_target, self.h_target, self.u_target, self.v_target,
                     self.h_zonal_relax, self._h_relax, self._u_relax, self._v_relax,
                     self._h_relax_on, self._u_relax_on, self._v_relax_on,
-                    self.hsub, self.iter)
+                    self.hsub, self.iter,
+                    self.y_periodic)                               
         self.time += dt
         self.iter += 1
 
