@@ -1219,13 +1219,17 @@ class SSWEM:
         ry_2d : True -> full 2D Orlanski; False -> 1D Orlanski limit (r_y == 0),
             everything else identical.
         """
+        samp = int(samp); nsamps = int(nsamps)
+        nsteps = samp * nsamps
         prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())
+        if prev_cols.size < 1:
+            raise ValueError("[OBC] prev_cols must contain at least one column to replay")
         b = int(b_obc)
         nudging_mode = int(bool(nudging))                # 0 = prescribe, 1 = inflow nudging
         alpha_in = float(alpha_in)
+        if nudging_mode == 1 and not (0.0 < alpha_in <= 1.0):
+            raise ValueError(f"[OBC] alpha_in must be in (0, 1] when nudging=True; got {alpha_in}")
         ry_on = int(bool(ry_2d))                         # [RY1D] 0 -> tangential term dropped -> 1D Orlanski
-
-        nsteps = nsamps * samp
         if h_bc_all is None or u_bc_all is None or v_bc_all is None:            # run_control(store_bc=False) returns None
             raise ValueError("[OBC] run_obc needs the control's per-step west-band stores "
                              "(h/u/v_bc_all): re-run run_control with store_bc=True")
