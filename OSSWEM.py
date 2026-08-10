@@ -1599,16 +1599,18 @@ class SSWEM:
         center_stride : [CL] keep every Nth step (default 1 = every step).
         center_fields : [CL] which of ('h','u','v') to record.
         """
+        samp = int(samp); nsamps = int(nsamps)
+        nsteps = samp * nsamps
         prev_cols = np.ascontiguousarray(np.asarray(prev_cols, dtype=np.int64).ravel())
+        if prev_cols.size < 1:
+            raise ValueError("[OBC] prev_cols must contain at least one column to replay")
         b = int(b_obc)
         nudging_mode = int(bool(nudging))                # 0 = prescribe, 1 = inflow nudging
         alpha_in = float(alpha_in)
+        if nudging_mode == 1 and not (0.0 < alpha_in <= 1.0):
+            raise ValueError(f"[OBC] alpha_in must be in (0, 1] when nudging=True; got {alpha_in}")
         ry_on = int(bool(ry_2d))                         # [RY1D] 0 -> tangential term dropped -> 1D Orlanski
-        inflow_persistent_mode = int(bool(inflow_persistent))   # [PERSIST]
-        r_max = float(r_max)                                    # [RMAX]
-        inflow_mode = int(inflow_mode)                          # 
-
-        nsteps = nsamps * samp
+        inflow_persistent_mode = int(bool(inflow_persistent))  # [PERSIST] 0 = inflow uses phi_ext (prescribe/nudge), 1 = inflow persists
         if h_bc_all is None or u_bc_all is None or v_bc_all is None:            # run_control(store_bc=False) returns None
             raise ValueError("[OBC] run_obc needs the control's per-step west-band stores "
                              "(h/u/v_bc_all): re-run run_control with store_bc=True")
@@ -1698,8 +1700,10 @@ class SSWEM:
         print(f"[RMAX] outflow CFL clamp: |rx|,|ry| <= r_max = {r_max:.4g} "        # [RMAX]
               f"(dt/dx = {dt / self.dx:.4g}, dt/dy = {dt / self.dy:.4g})")          # [RMAX]
         if inflow_persistent_mode:                                                  # [PERSIST]
-            print("[PERSIST] inflow rows PERSIST (rx clamped >= 0); external col-b data unused")  # [PERSIST]
-        if inflow_mode == 1:        
+            print("[PERSIST] inflow rows PERSIST (rx,ry clamped to 0); the external "  # [PERSIST]
+                  "col-b data is NOT read on inflow")                                  # [PERSIST]
+
+        if inflow_mode == 1:
             print(f" inflow_mode=1: RADIATION-INFLOW scheme on inflow rows "    # 
                   f"(reads col b+1 exterior @ n+1; |rx| clamped at r_max={r_max:.3g}; "  # 
                   f"extra col-b nudge {'ON, alpha_in=%.3g' % alpha_in if nudging_mode else 'OFF'})")  # 
@@ -1731,9 +1735,9 @@ class SSWEM:
                             rxy_h = rxy_h_row[it-1], rxy_u = rxy_u_row[it-1], rxy_v = rxy_v_row[it-1],
                             nudging_mode = nudging_mode, h_ext = h_ext_s,
                             u_ext = u_ext_s, v_ext = v_ext_s, alpha_in = alpha_in,
+                            inflow_persistent = inflow_persistent_mode,          # [PERSIST]
                             ry_on = ry_on,
-                            inflow_persistent = inflow_persistent_mode,         
-                            r_max = r_max,    
+                            r_max = r_max,
                             inflow_mode = inflow_mode,                           
                             h_ext_out = h_ext_out_s, u_ext_out = u_ext_out_s,    
                             v_ext_out = v_ext_out_s)                             
