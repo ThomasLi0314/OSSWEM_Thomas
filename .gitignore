@@ -7,10 +7,14 @@ __pycache__/
 *.npz
 *.html
 *.npy
+*.bak*
+*.gif
+*.txt
+
 
 OBC_Implementation/diagnosis/
 Neural_Net/
 # Exceeds GitHub 100MB file size limit
 2layer_jet/No-periodicity-NS-2-layer-baroclinic-jet.ipynb
 
-OSSWEM/OBC_Implementation/Checkpoints
+OBC_Implementation/Checkpoints
